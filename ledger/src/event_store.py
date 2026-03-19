@@ -3,9 +3,13 @@ from __future__ import annotations
 import json
 import uuid
 from dataclasses import dataclass, field
-from typing import Any
+from typing import Any, Callable
 
 import asyncpg
+
+# Upcast registry: event_type -> callable that transforms the raw payload dict.
+# Register with: EventStore.register_upcast("OldEventType", lambda p: {...})
+_UPCASTS: dict[str, Callable[[dict], dict]] = {}
 
 
 @dataclass
@@ -35,6 +39,11 @@ class EventStore:
     def __init__(self, pool: asyncpg.Pool) -> None:
         self._pool = pool
 
+    @staticmethod
+    def register_upcast(event_type: str, fn: Callable[[dict], dict]) -> None:
+        """Register a payload migration for a renamed or evolved event type."""
+        _UPCASTS[event_type] = fn
+
     async def append(
         self,
         stream_id: uuid.UUID,
@@ -48,20 +57,37 @@ class EventStore:
         expected_version: the current_version the caller observed.
             Pass 0 when creating a new stream.
         Raises OptimisticConcurrencyError on version mismatch.
+
+        Concurrency strategy:
+          1. INSERT ... ON CONFLICT DO NOTHING ensures the stream row exists.
+          2. SELECT ... FOR UPDATE acquires a row-level lock, serialising all
+             concurrent appenders — only one transaction holds the lock at a time.
+          3. Version check happens inside the lock, so no two agents can both
+             observe the same version and both succeed.
         """
         async with self._pool.acquire() as conn:
             async with conn.transaction():
-                # Upsert the stream row and lock it for the duration of the tx.
-                row = await conn.fetchrow(
+                # Ensure the stream row exists (no-op if already present).
+                await conn.execute(
                     """
                     INSERT INTO event_streams (stream_id, aggregate_type, current_version)
                     VALUES ($1, $2, 0)
-                    ON CONFLICT (stream_id) DO UPDATE
-                        SET updated_at = now()
-                    RETURNING current_version
+                    ON CONFLICT (stream_id) DO NOTHING
                     """,
                     stream_id,
                     aggregate_type,
+                )
+
+                # Lock the row for the duration of this transaction.
+                # Any concurrent append on the same stream blocks here until
+                # this transaction commits or rolls back.
+                row = await conn.fetchrow(
+                    """
+                    SELECT current_version FROM event_streams
+                    WHERE stream_id = $1
+                    FOR UPDATE
+                    """,
+                    stream_id,
                 )
                 current_version: int = row["current_version"]
 
@@ -112,7 +138,11 @@ class EventStore:
                 )
 
     async def load_stream(self, stream_id: uuid.UUID) -> list[RecordedEvent]:
-        """Return all events for a stream ordered by stream_position."""
+        """
+        Return all events for a stream ordered by stream_position.
+        Registered upcasts are applied to each event's payload before returning,
+        allowing read models to stay decoupled from historical schema changes.
+        """
         async with self._pool.acquire() as conn:
             rows = await conn.fetch(
                 """
@@ -131,8 +161,11 @@ class EventStore:
                 stream_position=row["stream_position"],
                 global_position=row["global_position"],
                 event_type=row["event_type"],
-                payload=row["payload"],
-                metadata=row["metadata"],
+                # Apply upcast if one is registered for this event type.
+                payload=_UPCASTS.get(row["event_type"], lambda p: p)(
+                    json.loads(row["payload"]) if isinstance(row["payload"], str) else row["payload"]
+                ),
+                metadata=json.loads(row["metadata"]) if isinstance(row["metadata"], str) else row["metadata"],
             )
             for row in rows
         ]

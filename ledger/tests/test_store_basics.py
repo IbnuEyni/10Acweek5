@@ -5,17 +5,23 @@ Unit:
   - Appending an event increments the stream version by 1.
   - Appending N events increments the stream version by N.
   - Loading a stream returns events in stream_position order.
+  - load_stream applies registered upcasts to event payloads.
 
 Integration (transactional atomicity):
   - append() writes to both events and outbox in one transaction.
   - If the events INSERT fails (duplicate position), outbox must stay empty.
+
+Mastery — Double-Decision Test:
+  - Two AI agents concurrently append to the same stream at the same version.
+  - Exactly one succeeds; the other raises OptimisticConcurrencyError.
 """
 
+import asyncio
 import uuid
 import pytest
 import asyncpg
 
-from src.event_store import EventStore, NewEvent, OptimisticConcurrencyError
+from src.event_store import EventStore, NewEvent, OptimisticConcurrencyError, _UPCASTS
 
 
 pytestmark = pytest.mark.asyncio
@@ -76,6 +82,55 @@ async def test_optimistic_concurrency_error_on_wrong_version(store, stream_id):
     await store.append(stream_id, "Order", [_event()], expected_version=0)
     with pytest.raises(OptimisticConcurrencyError):
         await store.append(stream_id, "Order", [_event()], expected_version=0)
+
+
+async def test_load_stream_applies_upcast(store, stream_id):
+    """Registered upcasts must transform the payload on load."""
+    _UPCASTS["LegacyEvent"] = lambda p: {**p, "upcasted": True}
+    try:
+        await store.append(stream_id, "Order", [NewEvent("LegacyEvent", {"v": 1})], expected_version=0)
+        recorded = await store.load_stream(stream_id)
+        assert recorded[0].payload == {"v": 1, "upcasted": True}
+    finally:
+        _UPCASTS.pop("LegacyEvent", None)
+
+
+# ---------------------------------------------------------------------------
+# Mastery — Double-Decision Test
+# ---------------------------------------------------------------------------
+
+async def test_double_decision_exactly_one_agent_wins(pool, stream_id):
+    """
+    Two AI agents race to append to the same stream at expected_version=0.
+    asyncio.gather fires both coroutines concurrently on the same event loop.
+    The FOR UPDATE lock in append() serialises them at the DB level:
+      - the first transaction to acquire the lock commits → "success"
+      - the second sees current_version=1 after the lock is released → "conflict"
+    Assert: exactly one success and one conflict; only one event in the stream.
+    """
+    store = EventStore(pool)
+
+    async def agent(name: str) -> str:
+        try:
+            await store.append(
+                stream_id,
+                "Order",
+                [NewEvent(f"DecisionBy_{name}", {"agent": name})],
+                expected_version=0,
+            )
+            return "success"
+        except OptimisticConcurrencyError:
+            return "conflict"
+
+    results = await asyncio.gather(agent("AgentA"), agent("AgentB"))
+
+    assert sorted(results) == ["conflict", "success"], (
+        f"Expected exactly one success and one conflict, got: {results}"
+    )
+
+    # Only the winner's event must exist in the stream.
+    events = await store.load_stream(stream_id)
+    assert len(events) == 1
 
 
 # ---------------------------------------------------------------------------
