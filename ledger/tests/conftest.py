@@ -32,5 +32,13 @@ async def store(pool):
 
 @pytest.fixture
 def stream_id():
+    """Returns a unique TEXT stream ID in the canonical loan-{id} format."""
     import uuid
-    return uuid.uuid4()
+    return f"loan-{uuid.uuid4()}"
+
+
+@pytest.fixture
+def session_stream_id():
+    """Returns a unique TEXT stream ID in the canonical agent-{id}-{session} format."""
+    import uuid
+    return f"agent-{uuid.uuid4()}-{uuid.uuid4()}"
