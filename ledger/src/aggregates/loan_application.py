@@ -87,60 +87,67 @@ class LoanApplicationAggregate(Aggregate):
         self.application_id: str = stream_id.removeprefix("loan-")
 
     # ------------------------------------------------------------------
-    # Event application (replay)
+    # Event application (replay) — one method per event type
     # ------------------------------------------------------------------
 
     def _apply(self, event: RecordedEvent) -> None:
-        match event.event_type:
-            case "ApplicationSubmitted":
-                self.state = ApplicationState.SUBMITTED
-                self.applicant_id = event.payload.get("applicant_id")
-                self.requested_amount = event.payload.get("requested_amount_usd")
+        """Dispatch to the dedicated per-event handler."""
+        handler = getattr(self, f"_on_{event.event_type}", None)
+        if handler is not None:
+            handler(event)
 
-            case "CreditAnalysisRequested":
-                self.state = ApplicationState.AWAITING_ANALYSIS
+    def _on_ApplicationSubmitted(self, event: RecordedEvent) -> None:
+        self.state = ApplicationState.SUBMITTED
+        self.applicant_id = event.payload.get("applicant_id")
+        self.requested_amount = event.payload.get("requested_amount_usd")
 
-            case "CreditAnalysisCompleted":
-                self.state = ApplicationState.ANALYSIS_COMPLETE
-                self.credit_analysis_recorded = True
-                # Register the session as a valid contributing session (Rule 6)
-                agent_id = event.payload.get("agent_id", "")
-                session_id = event.payload.get("session_id", "")
-                if agent_id and session_id:
-                    self.contributing_sessions.add(f"agent-{agent_id}-{session_id}")
+    def _on_CreditAnalysisRequested(self, event: RecordedEvent) -> None:
+        self.state = ApplicationState.AWAITING_ANALYSIS
 
-            case "HumanReviewOverride":
-                # Supersedes the credit analysis lock — allows re-analysis
-                self.credit_analysis_superseded = True
-                self.credit_analysis_recorded = False
+    def _on_CreditAnalysisCompleted(self, event: RecordedEvent) -> None:
+        self.state = ApplicationState.ANALYSIS_COMPLETE
+        self.credit_analysis_recorded = True
+        agent_id = event.payload.get("agent_id", "")
+        session_id = event.payload.get("session_id", "")
+        if agent_id and session_id:
+            self.contributing_sessions.add(f"agent-{agent_id}-{session_id}")
 
-            case "ComplianceCheckRequested":
-                self.state = ApplicationState.COMPLIANCE_REVIEW
-                for check in event.payload.get("checks_required", []):
-                    self.required_checks.add(check)
+    def _on_HumanReviewOverride(self, event: RecordedEvent) -> None:
+        # Supersedes the credit analysis lock — allows re-analysis
+        self.credit_analysis_superseded = True
+        self.credit_analysis_recorded = False
 
-            case "ComplianceRulePassed":
-                self.passed_checks.add(event.payload.get("rule_id", ""))
+    def _on_ComplianceCheckRequested(self, event: RecordedEvent) -> None:
+        self.state = ApplicationState.COMPLIANCE_REVIEW
+        for check in event.payload.get("checks_required", []):
+            self.required_checks.add(check)
 
-            case "DecisionGenerated":
-                self.state = ApplicationState.PENDING_DECISION
-                for session_id in event.payload.get("contributing_agent_sessions", []):
-                    self.contributing_sessions.add(session_id)
+    def _on_ComplianceRulePassed(self, event: RecordedEvent) -> None:
+        self.passed_checks.add(event.payload.get("rule_id", ""))
 
-            case "ApplicationApproved":
-                self.state = ApplicationState.FINAL_APPROVED
-                self.approved_amount = event.payload.get("approved_amount_usd")
+    def _on_DecisionGenerated(self, event: RecordedEvent) -> None:
+        self.state = ApplicationState.PENDING_DECISION
+        for session_id in event.payload.get("contributing_agent_sessions", []):
+            self.contributing_sessions.add(session_id)
 
-            case "ApplicationDeclined":
-                self.state = ApplicationState.FINAL_DECLINED
+    def _on_HumanReviewCompleted(self, event: RecordedEvent) -> None:
+        final = event.payload.get("final_decision", "")
+        if final == "APPROVE":
+            self.state = ApplicationState.APPROVED_PENDING_HUMAN
+        elif final == "DECLINE":
+            self.state = ApplicationState.DECLINED_PENDING_HUMAN
+        else:
+            raise DomainError(
+                f"HumanReviewCompleted has unrecognised final_decision '{final}'; "
+                "expected 'APPROVE' or 'DECLINE'."
+            )
 
-            case "HumanReviewCompleted":
-                override = event.payload.get("override", False)
-                final = event.payload.get("final_decision", "")
-                if final == "APPROVE":
-                    self.state = ApplicationState.APPROVED_PENDING_HUMAN
-                elif final == "DECLINE":
-                    self.state = ApplicationState.DECLINED_PENDING_HUMAN
+    def _on_ApplicationApproved(self, event: RecordedEvent) -> None:
+        self.state = ApplicationState.FINAL_APPROVED
+        self.approved_amount = event.payload.get("approved_amount_usd")
+
+    def _on_ApplicationDeclined(self, event: RecordedEvent) -> None:
+        self.state = ApplicationState.FINAL_DECLINED
 
     # ------------------------------------------------------------------
     # Internal helpers

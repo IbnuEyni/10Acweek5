@@ -33,29 +33,33 @@ class ComplianceRecordAggregate(Aggregate):
         self.clearance_issued: bool = False
 
     # ------------------------------------------------------------------
-    # Event application (replay)
+    # Event application (replay) — one method per event type
     # ------------------------------------------------------------------
 
     def _apply(self, event: RecordedEvent) -> None:
-        match event.event_type:
-            case "ComplianceCheckRequested":
-                self.regulation_set_version = event.payload.get("regulation_set_version")
-                for check in event.payload.get("checks_required", []):
-                    self.required_checks.add(check)
+        """Dispatch to the dedicated per-event handler."""
+        handler = getattr(self, f"_on_{event.event_type}", None)
+        if handler is not None:
+            handler(event)
 
-            case "ComplianceRulePassed":
-                rule_id = event.payload.get("rule_id", "")
-                rule_version = event.payload.get("rule_version", "")
-                self.passed_checks[rule_id] = rule_version
-                self.failed_checks.pop(rule_id, None)  # override a prior failure
+    def _on_ComplianceCheckRequested(self, event: RecordedEvent) -> None:
+        self.regulation_set_version = event.payload.get("regulation_set_version")
+        for check in event.payload.get("checks_required", []):
+            self.required_checks.add(check)
 
-            case "ComplianceRuleFailed":
-                rule_id = event.payload.get("rule_id", "")
-                self.failed_checks[rule_id] = event.payload.get("failure_reason", "")
-                self.passed_checks.pop(rule_id, None)
+    def _on_ComplianceRulePassed(self, event: RecordedEvent) -> None:
+        rule_id = event.payload.get("rule_id", "")
+        rule_version = event.payload.get("rule_version", "")
+        self.passed_checks[rule_id] = rule_version
+        self.failed_checks.pop(rule_id, None)  # override a prior failure
 
-            case "ComplianceClearanceIssued":
-                self.clearance_issued = True
+    def _on_ComplianceRuleFailed(self, event: RecordedEvent) -> None:
+        rule_id = event.payload.get("rule_id", "")
+        self.failed_checks[rule_id] = event.payload.get("failure_reason", "")
+        self.passed_checks.pop(rule_id, None)
+
+    def _on_ComplianceClearanceIssued(self, event: RecordedEvent) -> None:
+        self.clearance_issued = True
 
     # ------------------------------------------------------------------
     # Assertion helpers
@@ -105,9 +109,6 @@ class ComplianceRecordAggregate(Aggregate):
                 "checks_required": checks_required,
             },
         )
-        agg.regulation_set_version = regulation_set_version
-        for check in checks_required:
-            agg.required_checks.add(check)
         await agg.save(store)
         return agg
 
@@ -132,8 +133,6 @@ class ComplianceRecordAggregate(Aggregate):
                 "evidence_hash": evidence_hash,
             },
         )
-        self.passed_checks[rule_id] = rule_version
-        self.failed_checks.pop(rule_id, None)
         await self.save(store)
 
     async def record_rule_failed(
@@ -158,8 +157,6 @@ class ComplianceRecordAggregate(Aggregate):
                 "remediation_required": remediation_required,
             },
         )
-        self.failed_checks[rule_id] = failure_reason
-        self.passed_checks.pop(rule_id, None)
         await self.save(store)
 
     async def issue_clearance(self, store: EventStore) -> None:
@@ -170,5 +167,4 @@ class ComplianceRecordAggregate(Aggregate):
             "ComplianceClearanceIssued",
             {"application_id": self.application_id},
         )
-        self.clearance_issued = True
         await self.save(store)

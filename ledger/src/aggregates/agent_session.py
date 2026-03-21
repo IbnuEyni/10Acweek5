@@ -42,39 +42,43 @@ class AgentSessionAggregate(Aggregate):
         self._superseded_analyses: set[str] = set()
 
     # ------------------------------------------------------------------
-    # Event application (replay)
+    # Event application (replay) — one method per event type
     # ------------------------------------------------------------------
 
     def _apply(self, event: RecordedEvent) -> None:
-        match event.event_type:
-            case "AgentContextLoaded":
-                self.context_loaded = True
-                self.agent_id = event.payload.get("agent_id")
-                self.session_id = event.payload.get("session_id")
-                self.model_version = event.payload.get("model_version")
-                self.context_source = event.payload.get("context_source")
-                self.event_replay_from_position = event.payload.get(
-                    "event_replay_from_position", 0
-                )
+        """Dispatch to the dedicated per-event handler."""
+        handler = getattr(self, f"_on_{event.event_type}", None)
+        if handler is not None:
+            handler(event)
 
-            case "CreditAnalysisCompleted":
-                app_id = event.payload.get("application_id", "")
-                mv = event.payload.get("model_version", "")
-                self._credit_analyses[app_id] = mv
+    def _on_AgentContextLoaded(self, event: RecordedEvent) -> None:
+        self.context_loaded = True
+        self.agent_id = event.payload.get("agent_id")
+        self.session_id = event.payload.get("session_id")
+        self.model_version = event.payload.get("model_version")
+        self.context_source = event.payload.get("context_source")
+        self.event_replay_from_position = event.payload.get(
+            "event_replay_from_position", 0
+        )
 
-            case "HumanReviewOverride":
-                app_id = event.payload.get("application_id", "")
-                self._superseded_analyses.add(app_id)
-                self._credit_analyses.pop(app_id, None)
+    def _on_CreditAnalysisCompleted(self, event: RecordedEvent) -> None:
+        app_id = event.payload.get("application_id", "")
+        mv = event.payload.get("model_version", "")
+        self._credit_analyses[app_id] = mv
 
-            case "FraudScreeningCompleted":
-                pass  # no state change needed beyond version tracking
+    def _on_HumanReviewOverride(self, event: RecordedEvent) -> None:
+        app_id = event.payload.get("application_id", "")
+        self._superseded_analyses.add(app_id)
+        self._credit_analyses.pop(app_id, None)
 
-            case "DecisionGenerated":
-                pass  # recorded on LoanApplication stream; session just tracks it happened
+    def _on_FraudScreeningCompleted(self, event: RecordedEvent) -> None:
+        pass  # no state change needed beyond version tracking
 
-            case "SessionClosed":
-                self.closed = True
+    def _on_DecisionGenerated(self, event: RecordedEvent) -> None:
+        pass  # recorded on LoanApplication stream; session just tracks it happened
+
+    def _on_SessionClosed(self, event: RecordedEvent) -> None:
+        self.closed = True
 
     # ------------------------------------------------------------------
     # Assertion helpers (called by command handlers — brief pattern)
@@ -213,7 +217,7 @@ class AgentSessionAggregate(Aggregate):
         screening_model_version: str,
         input_data_hash: str,
     ) -> None:
-        """Business Rule 2: context must be loaded."""
+        """Business Rules 2 + domain: context must be loaded; fraud_score in [0.0, 1.0]."""
         self.assert_context_loaded()
         self.assert_not_closed()
 

@@ -37,20 +37,24 @@ class AuditLedgerAggregate(Aggregate):
         self.last_correlation_id: str | None = None
 
     # ------------------------------------------------------------------
-    # Event application (replay)
+    # Event application (replay) — one method per event type
     # ------------------------------------------------------------------
 
     def _apply(self, event: RecordedEvent) -> None:
-        match event.event_type:
-            case "AuditEntryRecorded":
-                stream_id = event.payload.get("source_stream_id", "")
-                if stream_id:
-                    self.linked_stream_ids.add(stream_id)
-                self.last_correlation_id = event.metadata.get("correlation_id")
+        """Dispatch to the dedicated per-event handler."""
+        handler = getattr(self, f"_on_{event.event_type}", None)
+        if handler is not None:
+            handler(event)
 
-            case "AuditIntegrityCheckRun":
-                self.last_integrity_hash = event.payload.get("integrity_hash")
-                self.events_verified_count = event.payload.get("events_verified_count", 0)
+    def _on_AuditEntryRecorded(self, event: RecordedEvent) -> None:
+        stream_id = event.payload.get("source_stream_id", "")
+        if stream_id:
+            self.linked_stream_ids.add(stream_id)
+        self.last_correlation_id = event.metadata.get("correlation_id")
+
+    def _on_AuditIntegrityCheckRun(self, event: RecordedEvent) -> None:
+        self.last_integrity_hash = event.payload.get("integrity_hash")
+        self.events_verified_count = event.payload.get("events_verified_count", 0)
 
     # ------------------------------------------------------------------
     # Commands
@@ -72,10 +76,6 @@ class AuditLedgerAggregate(Aggregate):
         correlation_id: str | None = None,
         causation_id: str | None = None,
     ) -> None:
-        """
-        Record a cross-cutting audit entry linking to a source stream event.
-        Maintains causal ordering via correlation_id.
-        """
         self._stage(
             "AuditEntryRecorded",
             {
@@ -86,7 +86,6 @@ class AuditLedgerAggregate(Aggregate):
                 "summary": summary,
             },
         )
-        self.linked_stream_ids.add(source_stream_id)
         await self.save(store, correlation_id=correlation_id, causation_id=causation_id)
 
     async def record_integrity_check(
@@ -97,10 +96,6 @@ class AuditLedgerAggregate(Aggregate):
         previous_hash: str | None,
         chain_valid: bool,
     ) -> None:
-        """
-        Append an AuditIntegrityCheckRun event forming the hash chain.
-        The chain: new_hash = sha256(previous_hash + event_hashes).
-        """
         self._stage(
             "AuditIntegrityCheckRun",
             {
@@ -111,6 +106,4 @@ class AuditLedgerAggregate(Aggregate):
                 "chain_valid": chain_valid,
             },
         )
-        self.last_integrity_hash = integrity_hash
-        self.events_verified_count = events_verified_count
         await self.save(store)
