@@ -3,10 +3,7 @@ from __future__ import annotations
 from typing import Any
 
 from src.event_store import EventStore, NewEvent, RecordedEvent
-
-
-class DomainError(Exception):
-    """Raised for all domain invariant violations."""
+from src.models.events import DomainError  # noqa: F401 — re-exported for aggregates
 
 
 class Aggregate:
