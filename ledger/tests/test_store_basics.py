@@ -418,8 +418,89 @@ async def test_failed_events_insert_leaves_outbox_empty(pool, stream_id):
 
 
 # ---------------------------------------------------------------------------
-# Concurrency — double-decision test
+# Edge cases
 # ---------------------------------------------------------------------------
+
+async def test_append_zero_events_is_noop(store, pool, stream_id):
+    """Appending an empty list must not change the stream version."""
+    await store.append(stream_id, [_event()], expected_version=0)
+    v_before = await store.stream_version(stream_id)
+    v_after = await store.append(stream_id, [], expected_version=v_before)
+    assert v_after == v_before
+    assert await _db_version(pool, stream_id) == v_before
+
+
+async def test_append_large_batch(store, pool, stream_id):
+    """A batch of 200 events must all land with correct sequential positions."""
+    n = 200
+    events = [_event(f"E{i}") for i in range(n)]
+    v = await store.append(stream_id, events, expected_version=0)
+    assert v == n
+    loaded = await store.load_stream(stream_id)
+    assert len(loaded) == n
+    assert [e.stream_position for e in loaded] == list(range(1, n + 1))
+
+
+async def test_load_all_multiple_event_type_filter(store, stream_id):
+    """load_all with multiple event_types returns only matching events."""
+    await store.append(
+        stream_id,
+        [_event("TypeA"), _event("TypeB"), _event("TypeC"), _event("TypeA")],
+        expected_version=0,
+    )
+    events = [e async for e in store.load_all(event_types=["TypeA", "TypeC"])]
+    types = [e.event_type for e in events]
+    assert set(types) == {"TypeA", "TypeC"}
+    assert "TypeB" not in types
+    assert len(events) == 3  # 2x TypeA + 1x TypeC
+
+
+async def test_load_all_from_position_with_type_filter(store, stream_id):
+    """Combining from_global_position and event_types must apply both filters."""
+    await store.append(
+        stream_id,
+        [_event("TypeA"), _event("TypeB"), _event("TypeA"), _event("TypeB")],
+        expected_version=0,
+    )
+    all_events = [e async for e in store.load_all()]
+    # Cutoff after the second event
+    cutoff = all_events[1].global_position
+
+    filtered = [e async for e in store.load_all(
+        from_global_position=cutoff, event_types=["TypeA"]
+    )]
+    assert all(e.event_type == "TypeA" for e in filtered)
+    assert all(e.global_position > cutoff for e in filtered)
+
+
+async def test_load_stream_exact_position_boundary(store, stream_id):
+    """from_position is exclusive; to_position is inclusive."""
+    await store.append(stream_id, [_event(f"E{i}") for i in range(5)], expected_version=0)
+    # from_position=2, to_position=4 → positions 3 and 4 only
+    events = await store.load_stream(stream_id, from_position=2, to_position=4)
+    assert [e.stream_position for e in events] == [3, 4]
+
+
+async def test_append_zero_events_does_not_write_outbox(store, pool, stream_id):
+    """Empty append must not produce any outbox rows."""
+    await store.append(stream_id, [_event()], expected_version=0)
+    outbox_before = await pool.acquire()
+    count_before = await outbox_before.fetchval(
+        "SELECT COUNT(*) FROM outbox WHERE event_id IN "
+        "(SELECT event_id FROM events WHERE stream_id = $1)", stream_id
+    )
+    await outbox_before.close()
+
+    await store.append(stream_id, [], expected_version=1)
+
+    async with pool.acquire() as conn:
+        count_after = await conn.fetchval(
+            "SELECT COUNT(*) FROM outbox WHERE event_id IN "
+            "(SELECT event_id FROM events WHERE stream_id = $1)", stream_id
+        )
+    assert count_after == count_before  # no new outbox rows
+
+
 
 async def test_double_decision_exactly_one_agent_wins(pool, stream_id):
     """
