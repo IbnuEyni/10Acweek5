@@ -1,27 +1,25 @@
 from __future__ import annotations
 
-import uuid
 from typing import Any
 
 from src.event_store import EventStore, NewEvent, RecordedEvent
 
 
 class DomainError(Exception):
-    """Single domain exception raised for all invariant violations."""
+    """Raised for all domain invariant violations."""
 
 
 class Aggregate:
     """
-    Base class implementing the Load-Validate-Append pattern.
+    Base class implementing the Load → Validate → Append pattern.
 
-    1. Load   — classmethod load() replays the event stream to rebuild state.
-    2. Validate — command methods assert invariants; raise DomainError if violated.
-    3. Append — save() writes staged events atomically at the observed version.
+    stream_id is a TEXT string (e.g. "loan-abc123") matching the schema.
+    version tracks the last stream_position seen; passed as expected_version on save().
     """
 
     AGGREGATE_TYPE: str = "Aggregate"
 
-    def __init__(self, stream_id: uuid.UUID) -> None:
+    def __init__(self, stream_id: str) -> None:
         self.stream_id = stream_id
         self.version: int = 0
         self._pending: list[NewEvent] = []
@@ -38,19 +36,43 @@ class Aggregate:
             self.version = event.stream_position
 
     @classmethod
-    async def load(cls, stream_id: uuid.UUID, store: EventStore) -> "Aggregate":
+    async def load(cls, stream_id: str, store: EventStore) -> "Aggregate":
         instance = cls(stream_id)
         instance._rebuild(await store.load_stream(stream_id))
         return instance
 
-    async def save(self, store: EventStore) -> None:
+    async def save(
+        self,
+        store: EventStore,
+        correlation_id: str | None = None,
+        causation_id: str | None = None,
+    ) -> None:
         if not self._pending:
             return
         await store.append(
-            self.stream_id,
-            self.AGGREGATE_TYPE,
-            self._pending,
+            stream_id=self.stream_id,
+            events=self._pending,
             expected_version=self.version,
+            aggregate_type=self.AGGREGATE_TYPE,
+            correlation_id=correlation_id,
+            causation_id=causation_id,
         )
+        # Apply pending events locally so _apply is the single source of truth.
+        # Command methods only stage events; all state mutation lives in _apply.
+        for i, new_event in enumerate(self._pending):
+            from src.event_store import RecordedEvent  # local import avoids cycle
+            from datetime import datetime as _dt, timezone as _tz
+            recorded = RecordedEvent(
+                event_id=new_event.event_id,
+                stream_id=self.stream_id,
+                stream_position=self.version + i + 1,
+                global_position=0,
+                event_type=new_event.event_type,
+                event_version=new_event.event_version,
+                payload=new_event.payload,
+                metadata=new_event.metadata,
+                recorded_at=_dt.now(_tz.utc),
+            )
+            self._apply(recorded)
         self.version += len(self._pending)
         self._pending.clear()
