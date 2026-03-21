@@ -233,26 +233,22 @@ async def handle_start_agent_session(
     cmd: StartAgentSessionCommand,
     store: EventStore,
 ) -> AgentSessionAggregate:
-    """
-    Gas Town: required before any agent decision tools.
-    Writes AgentContextLoaded as the first event in the session stream.
-    """
     existing = await store.stream_version(cmd.stream_id)
     if existing > 0:
         raise DomainError(
             f"AgentSession '{cmd.stream_id}' already exists at version {existing}. "
             "Use a new session_id for a new session."
         )
-
     return await AgentSessionAggregate.open(
-        cmd.stream_id,
-        store,
+        cmd.stream_id, store,
         agent_id=cmd.agent_id,
         context_source=cmd.context_source,
         event_replay_from_position=cmd.event_replay_from_position,
         context_token_count=cmd.context_token_count,
         model_version=cmd.model_version,
         session_id=cmd.session_id,
+        correlation_id=cmd.correlation_id,
+        causation_id=cmd.causation_id,
     )
 
 
@@ -260,12 +256,12 @@ async def handle_request_credit_analysis(
     cmd: RequestCreditAnalysisCommand,
     store: EventStore,
 ) -> LoanApplicationAggregate:
-    """
-    Advances LoanApplication from Submitted → AwaitingAnalysis.
-    Business Rule 1: must be in Submitted state.
-    """
     app = await LoanApplicationAggregate.load(store, cmd.application_id)
-    await app.request_credit_analysis(store, cmd.assigned_agent_id, cmd.priority)
+    await app.request_credit_analysis(
+        store, cmd.assigned_agent_id, cmd.priority,
+        correlation_id=cmd.correlation_id,
+        causation_id=cmd.causation_id,
+    )
     return app
 
 
@@ -273,23 +269,19 @@ async def handle_submit_application(
     cmd: SubmitApplicationCommand,
     store: EventStore,
 ) -> LoanApplicationAggregate:
-    """
-    Creates a new LoanApplication stream and records ApplicationSubmitted.
-    Raises DomainError if the stream already exists (duplicate application_id).
-    """
     existing = await store.stream_version(cmd.stream_id)
     if existing > 0:
         raise DomainError(
             f"LoanApplication '{cmd.stream_id}' already exists at version {existing}."
         )
-
     return await LoanApplicationAggregate.submit(
-        cmd.stream_id,
-        store,
+        cmd.stream_id, store,
         applicant_id=cmd.applicant_id,
         requested_amount_usd=cmd.requested_amount_usd,
         loan_purpose=cmd.loan_purpose,
         submission_channel=cmd.submission_channel,
+        correlation_id=cmd.correlation_id,
+        causation_id=cmd.causation_id,
     )
 
 
@@ -297,34 +289,16 @@ async def handle_credit_analysis_completed(
     cmd: CreditAnalysisCompletedCommand,
     store: EventStore,
 ) -> None:
-    """
-    Exact brief pattern: load → validate → determine → append.
-
-    1. Reconstruct current aggregate state from event history.
-    2. Validate — all business rules checked BEFORE any state change.
-    3. Determine new events — pure logic, no I/O.
-    4. Append atomically — optimistic concurrency enforced by store.
-
-    Business Rules enforced:
-    - Rule 1: LoanApplication must be in AwaitingAnalysis.
-    - Rule 2 (Gas Town): AgentSession must have context loaded.
-    - Rule 3: No duplicate credit analysis unless superseded.
-    - Model version must match session's declared version.
-    """
-    # 1. Reconstruct
     app = await LoanApplicationAggregate.load(store, cmd.application_id)
     agent = await AgentSessionAggregate.load(store, cmd.agent_id, cmd.session_id)
 
-    # 2. Validate
-    app.assert_awaiting_credit_analysis()          # Rule 1
-    agent.assert_context_loaded()                  # Rule 2 (Gas Town)
-    agent.assert_model_version_current(cmd.model_version)  # Rule 3
-    agent.assert_no_credit_analysis_locked(cmd.application_id)  # Rule 3
+    app.assert_awaiting_credit_analysis()
+    agent.assert_context_loaded()
+    agent.assert_model_version_current(cmd.model_version)
+    agent.assert_no_credit_analysis_locked(cmd.application_id)
 
-    # 3. Determine
     input_data_hash = _hash_inputs(cmd.input_data)
 
-    # 4. Append — session stream first, then loan stream
     await agent.record_credit_analysis(
         store,
         application_id=cmd.application_id,
@@ -334,8 +308,9 @@ async def handle_credit_analysis_completed(
         recommended_limit_usd=cmd.recommended_limit_usd,
         analysis_duration_ms=cmd.duration_ms,
         input_data_hash=input_data_hash,
+        correlation_id=cmd.correlation_id,
+        causation_id=cmd.causation_id,
     )
-
     await app.record_credit_analysis_completed(
         store,
         agent_id=cmd.agent_id,
@@ -346,6 +321,8 @@ async def handle_credit_analysis_completed(
         recommended_limit_usd=cmd.recommended_limit_usd,
         analysis_duration_ms=cmd.duration_ms,
         input_data_hash=input_data_hash,
+        correlation_id=cmd.correlation_id,
+        causation_id=cmd.causation_id,
     )
 
 
@@ -353,10 +330,6 @@ async def handle_fraud_screening_completed(
     cmd: FraudScreeningCompletedCommand,
     store: EventStore,
 ) -> None:
-    """
-    Business Rules 2 + domain validation delegated entirely to AgentSessionAggregate.
-    Handler is pure orchestration: load → call aggregate command → done.
-    """
     agent = await AgentSessionAggregate.load(store, cmd.agent_id, cmd.session_id)
     input_data_hash = _hash_inputs(cmd.input_data)
     await agent.record_fraud_screening(
@@ -366,6 +339,8 @@ async def handle_fraud_screening_completed(
         anomaly_flags=list(cmd.anomaly_flags),
         screening_model_version=cmd.screening_model_version,
         input_data_hash=input_data_hash,
+        correlation_id=cmd.correlation_id,
+        causation_id=cmd.causation_id,
     )
 
 
@@ -373,19 +348,14 @@ async def handle_compliance_check(
     cmd: ComplianceCheckCommand,
     store: EventStore,
 ) -> ComplianceRecordAggregate:
-    """
-    Records a compliance rule result (pass or fail).
-    Initialises the ComplianceRecord stream if it doesn't exist yet.
-    """
     existing = await store.stream_version(cmd.compliance_stream_id)
-
     if existing == 0:
-        # First check — initialise the compliance record
         compliance = await ComplianceRecordAggregate.request_checks(
-            cmd.compliance_stream_id,
-            store,
+            cmd.compliance_stream_id, store,
             regulation_set_version=cmd.regulation_set_version,
             checks_required=list(cmd.checks_required) or [cmd.rule_id],
+            correlation_id=cmd.correlation_id,
+            causation_id=cmd.causation_id,
         )
     else:
         compliance = await ComplianceRecordAggregate.load(store, cmd.application_id)
@@ -397,6 +367,8 @@ async def handle_compliance_check(
             rule_id=cmd.rule_id,
             rule_version=cmd.rule_version,
             evidence_hash=evidence_hash,
+            correlation_id=cmd.correlation_id,
+            causation_id=cmd.causation_id,
         )
     else:
         await compliance.record_rule_failed(
@@ -405,8 +377,9 @@ async def handle_compliance_check(
             rule_version=cmd.rule_version,
             failure_reason=cmd.failure_reason,
             remediation_required=cmd.remediation_required,
+            correlation_id=cmd.correlation_id,
+            causation_id=cmd.causation_id,
         )
-
     return compliance
 
 
@@ -414,24 +387,10 @@ async def handle_generate_decision(
     cmd: GenerateDecisionCommand,
     store: EventStore,
 ) -> LoanApplicationAggregate:
-    """
-    Business Rules:
-    - Rule 1: LoanApplication must be in ComplianceReview.
-    - Rule 4: Confidence floor — score < 0.6 forces REFER.
-    - Rule 5 (cross-stream): ComplianceRecord stream must have all required
-              checks passed before a decision can be generated.
-    - Rule 6: Causal chain — contributing_agent_sessions must reference
-              sessions that processed this application.
-    """
     app = await LoanApplicationAggregate.load(store, cmd.application_id)
-
-    # Rule 5: cross-stream compliance check — load ComplianceRecord stream
     compliance = await ComplianceRecordAggregate.load(store, cmd.application_id)
     compliance.assert_all_checks_passed()
-
-    # Rule 6: validate causal chain before any state change
     app.assert_contributing_sessions_valid(list(cmd.contributing_agent_sessions))
-
     await app.generate_decision(
         store,
         orchestrator_agent_id=cmd.orchestrator_agent_id,
@@ -440,8 +399,9 @@ async def handle_generate_decision(
         contributing_agent_sessions=list(cmd.contributing_agent_sessions),
         decision_basis_summary=cmd.decision_basis_summary,
         model_versions=cmd.model_versions,
+        correlation_id=cmd.correlation_id,
+        causation_id=cmd.causation_id,
     )
-
     return app
 
 
@@ -449,20 +409,16 @@ async def handle_human_review_completed(
     cmd: HumanReviewCompletedCommand,
     store: EventStore,
 ) -> LoanApplicationAggregate:
-    """
-    Business Rule 1: LoanApplication must be in PendingDecision.
-    If override=True, override_reason is required.
-    """
     app = await LoanApplicationAggregate.load(store, cmd.application_id)
-
     await app.complete_human_review(
         store,
         reviewer_id=cmd.reviewer_id,
         final_decision=cmd.final_decision,
         override=cmd.override,
         override_reason=cmd.override_reason,
+        correlation_id=cmd.correlation_id,
+        causation_id=cmd.causation_id,
     )
-
     return app
 
 
@@ -470,17 +426,9 @@ async def handle_approve_application(
     cmd: ApproveApplicationCommand,
     store: EventStore,
 ) -> LoanApplicationAggregate:
-    """
-    Business Rules 1 + 5 (cross-stream):
-    - LoanApplication must be in ApprovedPendingHuman.
-    - ComplianceRecord stream must have all required checks passed.
-    """
     app = await LoanApplicationAggregate.load(store, cmd.application_id)
-
-    # Rule 5: cross-stream — verify ComplianceRecord stream directly
     compliance = await ComplianceRecordAggregate.load(store, cmd.application_id)
     compliance.assert_all_checks_passed()
-
     await app.approve(
         store,
         approved_amount_usd=cmd.approved_amount_usd,
@@ -488,6 +436,8 @@ async def handle_approve_application(
         conditions=list(cmd.conditions),
         approved_by=cmd.approved_by,
         effective_date=cmd.effective_date,
+        correlation_id=cmd.correlation_id,
+        causation_id=cmd.causation_id,
     )
     return app
 
@@ -496,12 +446,13 @@ async def handle_decline_application(
     cmd: DeclineApplicationCommand,
     store: EventStore,
 ) -> LoanApplicationAggregate:
-    """Business Rule 1: LoanApplication must be in DeclinedPendingHuman."""
     app = await LoanApplicationAggregate.load(store, cmd.application_id)
     await app.decline(
         store,
         decline_reasons=list(cmd.decline_reasons),
         declined_by=cmd.declined_by,
         adverse_action_notice_required=cmd.adverse_action_notice_required,
+        correlation_id=cmd.correlation_id,
+        causation_id=cmd.causation_id,
     )
     return app
