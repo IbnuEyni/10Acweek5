@@ -354,23 +354,11 @@ async def handle_fraud_screening_completed(
     store: EventStore,
 ) -> None:
     """
-    Business Rules:
-    - Rule 2 (Gas Town): AgentSession must have context loaded.
-    - fraud_score must be 0.0–1.0.
+    Business Rules 2 + domain validation delegated entirely to AgentSessionAggregate.
+    Handler is pure orchestration: load → call aggregate command → done.
     """
     agent = await AgentSessionAggregate.load(store, cmd.agent_id, cmd.session_id)
-
-    # Validate
-    agent.assert_context_loaded()
-    agent.assert_not_closed()
-
-    if not (0.0 <= cmd.fraud_score <= 1.0):
-        raise DomainError(
-            f"fraud_score must be in [0.0, 1.0], got {cmd.fraud_score}."
-        )
-
     input_data_hash = _hash_inputs(cmd.input_data)
-
     await agent.record_fraud_screening(
         store,
         application_id=cmd.application_id,
