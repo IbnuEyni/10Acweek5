@@ -139,7 +139,10 @@ class LoanApplicationAggregate(Aggregate):
         else:
             raise DomainError(
                 f"HumanReviewCompleted has unrecognised final_decision '{final}'; "
-                "expected 'APPROVE' or 'DECLINE'."
+                "expected 'APPROVE' or 'DECLINE'.",
+                aggregate_type=self.AGGREGATE_TYPE,
+                stream_id=self.stream_id,
+                rule="invalid_final_decision",
             )
 
     def _on_ApplicationApproved(self, event: RecordedEvent) -> None:
@@ -157,7 +160,10 @@ class LoanApplicationAggregate(Aggregate):
         if self.state not in allowed:
             raise DomainError(
                 f"LoanApplication '{self.stream_id}' is in state '{self.state.value}'; "
-                f"expected one of {[s.value for s in allowed]}."
+                f"expected one of {[s.value for s in allowed]}.",
+                aggregate_type=self.AGGREGATE_TYPE,
+                stream_id=self.stream_id,
+                rule="state_transition",
             )
 
     def _transition(
@@ -170,7 +176,10 @@ class LoanApplicationAggregate(Aggregate):
         if target not in allowed:
             raise DomainError(
                 f"Cannot transition LoanApplication '{self.stream_id}' "
-                f"from '{self.state.value}' to '{target.value}'."
+                f"from '{self.state.value}' to '{target.value}'.",
+                aggregate_type=self.AGGREGATE_TYPE,
+                stream_id=self.stream_id,
+                rule="state_transition",
             )
         self._stage(event_type, payload)
         # Do NOT set self.state here — _apply is the single source of truth.
@@ -189,7 +198,10 @@ class LoanApplicationAggregate(Aggregate):
         if self.credit_analysis_recorded and not self.credit_analysis_superseded:
             raise DomainError(
                 f"LoanApplication '{self.stream_id}' already has a credit analysis. "
-                "A HumanReviewOverride is required before re-analysis."
+                "A HumanReviewOverride is required before re-analysis.",
+                aggregate_type=self.AGGREGATE_TYPE,
+                stream_id=self.stream_id,
+                rule="model_version_locking",
             )
 
     def assert_compliance_complete(self) -> None:
@@ -198,7 +210,10 @@ class LoanApplicationAggregate(Aggregate):
         if missing:
             raise DomainError(
                 f"LoanApplication '{self.stream_id}' cannot be approved: "
-                f"compliance checks not yet passed: {sorted(missing)}."
+                f"compliance checks not yet passed: {sorted(missing)}.",
+                aggregate_type=self.AGGREGATE_TYPE,
+                stream_id=self.stream_id,
+                rule="compliance_dependency",
             )
 
     def assert_contributing_sessions_valid(
@@ -212,7 +227,10 @@ class LoanApplicationAggregate(Aggregate):
         if invalid:
             raise DomainError(
                 f"DecisionGenerated references sessions that never processed "
-                f"application '{self.application_id}': {sorted(invalid)}."
+                f"application '{self.application_id}': {sorted(invalid)}.",
+                aggregate_type=self.AGGREGATE_TYPE,
+                stream_id=self.stream_id,
+                rule="causal_chain",
             )
 
     # ------------------------------------------------------------------
@@ -233,6 +251,8 @@ class LoanApplicationAggregate(Aggregate):
         requested_amount_usd: float,
         loan_purpose: str = "",
         submission_channel: str = "api",
+        correlation_id: str | None = None,
+        causation_id: str | None = None,
     ) -> "LoanApplicationAggregate":
         agg = cls(stream_id)
         agg._stage(
@@ -245,7 +265,7 @@ class LoanApplicationAggregate(Aggregate):
                 "submission_channel": submission_channel,
             },
         )
-        await agg.save(store)  # save() applies events via _apply — single source of truth
+        await agg.save(store, correlation_id=correlation_id, causation_id=causation_id)
         return agg
 
     async def request_credit_analysis(
@@ -253,6 +273,8 @@ class LoanApplicationAggregate(Aggregate):
         store: EventStore,
         assigned_agent_id: str,
         priority: str = "normal",
+        correlation_id: str | None = None,
+        causation_id: str | None = None,
     ) -> None:
         """Business Rule 1: only valid from Submitted state."""
         self._transition(
@@ -264,7 +286,7 @@ class LoanApplicationAggregate(Aggregate):
                 "priority": priority,
             },
         )
-        await self.save(store)
+        await self.save(store, correlation_id=correlation_id, causation_id=causation_id)
 
     async def record_credit_analysis_completed(
         self,
@@ -277,12 +299,13 @@ class LoanApplicationAggregate(Aggregate):
         recommended_limit_usd: float,
         analysis_duration_ms: int,
         input_data_hash: str,
+        correlation_id: str | None = None,
+        causation_id: str | None = None,
     ) -> None:
         """
         Business Rules 1 + 3:
         - Must be in AwaitingAnalysis.
         - No duplicate credit analysis unless superseded.
-        Records the session as a contributing session for Rule 6.
         """
         self.assert_awaiting_credit_analysis()
         self.assert_no_credit_analysis_locked()
@@ -301,13 +324,15 @@ class LoanApplicationAggregate(Aggregate):
                 "input_data_hash": input_data_hash,
             },
         )
-        await self.save(store)
+        await self.save(store, correlation_id=correlation_id, causation_id=causation_id)
 
     async def request_compliance_review(
         self,
         store: EventStore,
         regulation_set_version: str,
         checks_required: list[str],
+        correlation_id: str | None = None,
+        causation_id: str | None = None,
     ) -> None:
         """Business Rule 1: must be in AnalysisComplete."""
         self._transition(
@@ -319,7 +344,7 @@ class LoanApplicationAggregate(Aggregate):
                 "checks_required": checks_required,
             },
         )
-        await self.save(store)
+        await self.save(store, correlation_id=correlation_id, causation_id=causation_id)
 
     async def record_compliance_passed(
         self,
@@ -327,6 +352,8 @@ class LoanApplicationAggregate(Aggregate):
         rule_id: str,
         rule_version: str,
         evidence_hash: str,
+        correlation_id: str | None = None,
+        causation_id: str | None = None,
     ) -> None:
         """Must be in ComplianceReview. Does not advance state — accumulates passes."""
         self._assert_state(ApplicationState.COMPLIANCE_REVIEW)
@@ -339,7 +366,7 @@ class LoanApplicationAggregate(Aggregate):
                 "evidence_hash": evidence_hash,
             },
         )
-        await self.save(store)
+        await self.save(store, correlation_id=correlation_id, causation_id=causation_id)
 
     async def generate_decision(
         self,
@@ -350,6 +377,8 @@ class LoanApplicationAggregate(Aggregate):
         contributing_agent_sessions: list[str],
         decision_basis_summary: str,
         model_versions: dict,
+        correlation_id: str | None = None,
+        causation_id: str | None = None,
     ) -> None:
         """
         Business Rules 1 + 4 + 6:
@@ -360,7 +389,6 @@ class LoanApplicationAggregate(Aggregate):
         self._assert_state(ApplicationState.COMPLIANCE_REVIEW)
         self.assert_contributing_sessions_valid(contributing_agent_sessions)
 
-        # Business Rule 4: confidence floor
         forced_refer = confidence_score < CONFIDENCE_FLOOR
         effective_recommendation = "REFER" if forced_refer else recommendation
 
@@ -378,7 +406,7 @@ class LoanApplicationAggregate(Aggregate):
                 "forced_refer": forced_refer,
             },
         )
-        await self.save(store)
+        await self.save(store, correlation_id=correlation_id, causation_id=causation_id)
 
     async def complete_human_review(
         self,
@@ -387,6 +415,8 @@ class LoanApplicationAggregate(Aggregate):
         final_decision: str,
         override: bool = False,
         override_reason: str = "",
+        correlation_id: str | None = None,
+        causation_id: str | None = None,
     ) -> None:
         """
         Business Rule 1: must be in PendingDecision.
@@ -394,8 +424,12 @@ class LoanApplicationAggregate(Aggregate):
         """
         self._assert_state(ApplicationState.PENDING_DECISION)
         if override and not override_reason:
-            raise DomainError("override_reason is required when override=True.")
-
+            raise DomainError(
+                "override_reason is required when override=True.",
+                aggregate_type=self.AGGREGATE_TYPE,
+                stream_id=self.stream_id,
+                rule="override_reason_required",
+            )
         target = (
             ApplicationState.APPROVED_PENDING_HUMAN
             if final_decision == "APPROVE"
@@ -412,7 +446,7 @@ class LoanApplicationAggregate(Aggregate):
                 "override_reason": override_reason,
             },
         )
-        await self.save(store)
+        await self.save(store, correlation_id=correlation_id, causation_id=causation_id)
 
     async def approve(
         self,
@@ -422,11 +456,13 @@ class LoanApplicationAggregate(Aggregate):
         conditions: list[str],
         approved_by: str,
         effective_date: str,
+        correlation_id: str | None = None,
+        causation_id: str | None = None,
     ) -> None:
         """
         Business Rules 1 + 5:
         - Must be in ApprovedPendingHuman.
-        - All required compliance checks must be passed (loan-stream check).
+        - All required compliance checks must be passed.
         """
         self._assert_state(ApplicationState.APPROVED_PENDING_HUMAN)
         self.assert_compliance_complete()
@@ -442,7 +478,7 @@ class LoanApplicationAggregate(Aggregate):
                 "effective_date": effective_date,
             },
         )
-        await self.save(store)
+        await self.save(store, correlation_id=correlation_id, causation_id=causation_id)
 
     async def decline(
         self,
@@ -450,6 +486,8 @@ class LoanApplicationAggregate(Aggregate):
         decline_reasons: list[str],
         declined_by: str,
         adverse_action_notice_required: bool = False,
+        correlation_id: str | None = None,
+        causation_id: str | None = None,
     ) -> None:
         """Business Rule 1: must be in DeclinedPendingHuman."""
         self._assert_state(ApplicationState.DECLINED_PENDING_HUMAN)
@@ -463,6 +501,6 @@ class LoanApplicationAggregate(Aggregate):
                 "adverse_action_notice_required": adverse_action_notice_required,
             },
         )
-        await self.save(store)
+        await self.save(store, correlation_id=correlation_id, causation_id=causation_id)
 
 

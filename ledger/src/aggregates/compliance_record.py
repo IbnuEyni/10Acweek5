@@ -72,13 +72,19 @@ class ComplianceRecordAggregate(Aggregate):
         if missing or failed:
             raise DomainError(
                 f"ComplianceRecord '{self.stream_id}' cannot issue clearance. "
-                f"Missing: {sorted(missing)}. Failed: {sorted(failed)}."
+                f"Missing: {sorted(missing)}. Failed: {sorted(failed)}.",
+                aggregate_type=self.AGGREGATE_TYPE,
+                stream_id=self.stream_id,
+                rule="compliance_dependency",
             )
 
     def assert_not_cleared(self) -> None:
         if self.clearance_issued:
             raise DomainError(
-                f"ComplianceRecord '{self.stream_id}' has already issued clearance."
+                f"ComplianceRecord '{self.stream_id}' has already issued clearance.",
+                aggregate_type=self.AGGREGATE_TYPE,
+                stream_id=self.stream_id,
+                rule="clearance_already_issued",
             )
 
     # ------------------------------------------------------------------
@@ -99,6 +105,8 @@ class ComplianceRecordAggregate(Aggregate):
         store: EventStore,
         regulation_set_version: str,
         checks_required: list[str],
+        correlation_id: str | None = None,
+        causation_id: str | None = None,
     ) -> "ComplianceRecordAggregate":
         agg = cls(stream_id)
         agg._stage(
@@ -109,7 +117,7 @@ class ComplianceRecordAggregate(Aggregate):
                 "checks_required": checks_required,
             },
         )
-        await agg.save(store)
+        await agg.save(store, correlation_id=correlation_id, causation_id=causation_id)
         return agg
 
     async def record_rule_passed(
@@ -118,11 +126,15 @@ class ComplianceRecordAggregate(Aggregate):
         rule_id: str,
         rule_version: str,
         evidence_hash: str,
+        correlation_id: str | None = None,
+        causation_id: str | None = None,
     ) -> None:
-        """Every check must reference the specific regulation version evaluated against."""
         if not self.regulation_set_version:
             raise DomainError(
-                f"ComplianceRecord '{self.stream_id}' has no active check request."
+                f"ComplianceRecord '{self.stream_id}' has no active check request.",
+                aggregate_type=self.AGGREGATE_TYPE,
+                stream_id=self.stream_id,
+                rule="no_active_check_request",
             )
         self._stage(
             "ComplianceRulePassed",
@@ -133,7 +145,7 @@ class ComplianceRecordAggregate(Aggregate):
                 "evidence_hash": evidence_hash,
             },
         )
-        await self.save(store)
+        await self.save(store, correlation_id=correlation_id, causation_id=causation_id)
 
     async def record_rule_failed(
         self,
@@ -142,10 +154,15 @@ class ComplianceRecordAggregate(Aggregate):
         rule_version: str,
         failure_reason: str,
         remediation_required: bool = False,
+        correlation_id: str | None = None,
+        causation_id: str | None = None,
     ) -> None:
         if not self.regulation_set_version:
             raise DomainError(
-                f"ComplianceRecord '{self.stream_id}' has no active check request."
+                f"ComplianceRecord '{self.stream_id}' has no active check request.",
+                aggregate_type=self.AGGREGATE_TYPE,
+                stream_id=self.stream_id,
+                rule="no_active_check_request",
             )
         self._stage(
             "ComplianceRuleFailed",
@@ -157,14 +174,18 @@ class ComplianceRecordAggregate(Aggregate):
                 "remediation_required": remediation_required,
             },
         )
-        await self.save(store)
+        await self.save(store, correlation_id=correlation_id, causation_id=causation_id)
 
-    async def issue_clearance(self, store: EventStore) -> None:
-        """Cannot issue clearance without all mandatory checks passed."""
+    async def issue_clearance(
+        self,
+        store: EventStore,
+        correlation_id: str | None = None,
+        causation_id: str | None = None,
+    ) -> None:
         self.assert_all_checks_passed()
         self.assert_not_cleared()
         self._stage(
             "ComplianceClearanceIssued",
             {"application_id": self.application_id},
         )
-        await self.save(store)
+        await self.save(store, correlation_id=correlation_id, causation_id=causation_id)

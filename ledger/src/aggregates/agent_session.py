@@ -89,23 +89,34 @@ class AgentSessionAggregate(Aggregate):
         if not self.context_loaded:
             raise DomainError(
                 "AgentContextLoaded must be the first event before any decisions. "
-                f"Session '{self.stream_id}' has no loaded context."
+                f"Session '{self.stream_id}' has no loaded context.",
+                aggregate_type=self.AGGREGATE_TYPE,
+                stream_id=self.stream_id,
+                rule="gas_town",
             )
 
     def assert_not_closed(self) -> None:
         if self.closed:
-            raise DomainError(f"Session '{self.stream_id}' is already closed.")
+            raise DomainError(
+                f"Session '{self.stream_id}' is already closed.",
+                aggregate_type=self.AGGREGATE_TYPE,
+                stream_id=self.stream_id,
+                rule="session_closed",
+            )
 
     def assert_model_version_current(self, required_version: str) -> None:
         """
         Business Rule 3: the session's declared model_version must match
-        the version the command claims to be using. Prevents stale-model decisions.
+        the version the command claims to be using.
         """
         if self.model_version and self.model_version != required_version:
             raise DomainError(
                 f"Session '{self.stream_id}' was opened with model_version "
                 f"'{self.model_version}', but command specifies '{required_version}'. "
-                "Start a new session with the current model version."
+                "Start a new session with the current model version.",
+                aggregate_type=self.AGGREGATE_TYPE,
+                stream_id=self.stream_id,
+                rule="model_version_locking",
             )
 
     def assert_no_credit_analysis_locked(self, application_id: str) -> None:
@@ -120,7 +131,10 @@ class AgentSessionAggregate(Aggregate):
             raise DomainError(
                 f"Session '{self.stream_id}' already has a credit analysis for "
                 f"application '{application_id}'. A HumanReviewOverride is required "
-                "before re-analysis."
+                "before re-analysis.",
+                aggregate_type=self.AGGREGATE_TYPE,
+                stream_id=self.stream_id,
+                rule="model_version_locking",
             )
 
     # ------------------------------------------------------------------
@@ -146,11 +160,9 @@ class AgentSessionAggregate(Aggregate):
         context_token_count: int = 0,
         model_version: str = "",
         session_id: str = "",
+        correlation_id: str | None = None,
+        causation_id: str | None = None,
     ) -> "AgentSessionAggregate":
-        """
-        Gas Town: AgentContextLoaded is always the first event.
-        No agent may make a decision without first declaring its context source.
-        """
         agg = cls(stream_id)
         agg._stage(
             "AgentContextLoaded",
@@ -164,9 +176,7 @@ class AgentSessionAggregate(Aggregate):
                 "context": context or {},
             },
         )
-        # Do NOT set state directly here — save() calls _apply which sets
-        # context_loaded, agent_id, model_version, context_source.
-        await agg.save(store)
+        await agg.save(store, correlation_id=correlation_id, causation_id=causation_id)
         return agg
 
     async def record_credit_analysis(
@@ -179,18 +189,13 @@ class AgentSessionAggregate(Aggregate):
         recommended_limit_usd: float,
         analysis_duration_ms: int,
         input_data_hash: str,
+        correlation_id: str | None = None,
+        causation_id: str | None = None,
     ) -> None:
-        """
-        Business Rules 2 + 3:
-        - Context must be loaded (Gas Town).
-        - Model version must match session's declared version.
-        - No duplicate credit analysis for the same application.
-        """
         self.assert_context_loaded()
         self.assert_not_closed()
         self.assert_model_version_current(model_version)
         self.assert_no_credit_analysis_locked(application_id)
-
         self._stage(
             "CreditAnalysisCompleted",
             {
@@ -205,8 +210,7 @@ class AgentSessionAggregate(Aggregate):
                 "input_data_hash": input_data_hash,
             },
         )
-        # Do NOT set self._credit_analyses here — _apply is the single source of truth.
-        await self.save(store)
+        await self.save(store, correlation_id=correlation_id, causation_id=causation_id)
 
     async def record_fraud_screening(
         self,
@@ -216,16 +220,18 @@ class AgentSessionAggregate(Aggregate):
         anomaly_flags: list[str],
         screening_model_version: str,
         input_data_hash: str,
+        correlation_id: str | None = None,
+        causation_id: str | None = None,
     ) -> None:
-        """Business Rules 2 + domain: context must be loaded; fraud_score in [0.0, 1.0]."""
         self.assert_context_loaded()
         self.assert_not_closed()
-
         if not (0.0 <= fraud_score <= 1.0):
             raise DomainError(
-                f"fraud_score must be in [0.0, 1.0], got {fraud_score}."
+                f"fraud_score must be in [0.0, 1.0], got {fraud_score}.",
+                aggregate_type=self.AGGREGATE_TYPE,
+                stream_id=self.stream_id,
+                rule="fraud_score_range",
             )
-
         self._stage(
             "FraudScreeningCompleted",
             {
@@ -237,7 +243,7 @@ class AgentSessionAggregate(Aggregate):
                 "input_data_hash": input_data_hash,
             },
         )
-        await self.save(store)
+        await self.save(store, correlation_id=correlation_id, causation_id=causation_id)
 
     async def record_decision(
         self,
@@ -245,18 +251,13 @@ class AgentSessionAggregate(Aggregate):
         recommendation: str,
         confidence_score: float,
         rationale: str = "",
+        correlation_id: str | None = None,
+        causation_id: str | None = None,
     ) -> None:
-        """
-        Business Rules 2 + 4:
-        - Context must be loaded (Gas Town).
-        - Confidence floor: score < 0.6 forces REFER.
-        """
         self.assert_context_loaded()
         self.assert_not_closed()
-
         forced = confidence_score < CONFIDENCE_FLOOR
         effective_recommendation = "REFER" if forced else recommendation
-
         self._stage(
             "DecisionGenerated",
             {
@@ -266,11 +267,15 @@ class AgentSessionAggregate(Aggregate):
                 "forced_refer": forced,
             },
         )
-        await self.save(store)
+        await self.save(store, correlation_id=correlation_id, causation_id=causation_id)
 
-    async def close(self, store: EventStore) -> None:
+    async def close(
+        self,
+        store: EventStore,
+        correlation_id: str | None = None,
+        causation_id: str | None = None,
+    ) -> None:
         self.assert_context_loaded()
         self.assert_not_closed()
         self._stage("SessionClosed", {})
-        # Do NOT set self.closed here — _apply is the single source of truth.
-        await self.save(store)
+        await self.save(store, correlation_id=correlation_id, causation_id=causation_id)
