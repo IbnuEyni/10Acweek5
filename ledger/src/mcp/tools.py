@@ -257,8 +257,9 @@ def register_tools(server: Server, store: EventStore) -> None:
                     duration_ms=arguments["duration_ms"],
                 )
                 await handle_credit_analysis_completed(cmd, store)
-                version = await store.stream_version(cmd.loan_stream_id)
-                return _ok({"new_stream_version": version})
+                events = await store.load_stream(cmd.loan_stream_id)
+                last = events[-1]
+                return _ok({"event_id": str(last.event_id), "new_stream_version": last.stream_position})
 
             elif name == "record_fraud_screening":
                 cmd = FraudScreeningCompletedCommand(
@@ -270,7 +271,9 @@ def register_tools(server: Server, store: EventStore) -> None:
                     screening_model_version=arguments["screening_model_version"],
                 )
                 await handle_fraud_screening_completed(cmd, store)
-                return _ok({"recorded": True})
+                session_events = await store.load_stream(cmd.session_stream_id)
+                last = session_events[-1]
+                return _ok({"event_id": str(last.event_id), "new_stream_version": last.stream_position})
 
             elif name == "record_compliance_check":
                 cmd = ComplianceCheckCommand(

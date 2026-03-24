@@ -8,9 +8,14 @@ from typing import Any, AsyncIterator, Callable
 import asyncpg
 
 # ---------------------------------------------------------------------------
-# Upcast registry
-# Registered with: EventStore.register_upcast("OldType", from_version=1, fn)
-# Applied transparently on every load_stream() / load_all() call.
+# Upcast registry — single source of truth for all schema migrations.
+#
+# The module-level _UPCASTS dict is the backing store for UpcasterRegistry.
+# Both EventStore.register_upcast() and UpcasterRegistry.register() write here,
+# so the two APIs are unified: registering via either path is visible to both.
+#
+# Applied transparently on every load_stream() / load_all() call via _apply_upcasts.
+# Callers never invoke upcasters manually — the store does it at read time.
 # ---------------------------------------------------------------------------
 _UPCASTS: dict[tuple[str, int], Callable[[dict], dict]] = {}
 
@@ -166,7 +171,12 @@ class EventStore:
         from_version: int,
         fn: Callable[[dict], dict],
     ) -> None:
-        """Register a payload migration from (event_type, from_version) → from_version+1."""
+        """
+        Register a payload migration from (event_type, from_version) → from_version+1.
+
+        Writes to the module-level _UPCASTS dict, which is also the backing store
+        for UpcasterRegistry — both registration paths are unified.
+        """
         _UPCASTS[(event_type, from_version)] = fn
 
     # ------------------------------------------------------------------
