@@ -93,3 +93,79 @@ CREATE TABLE outbox (
 -- Published rows excluded entirely — index stays small as the outbox drains.
 -- Without this a full table scan would grow unboundedly as history accumulates.
 CREATE INDEX idx_outbox_pending ON outbox (created_at) WHERE published_at IS NULL;
+
+-- ============================================================
+-- PHASE 3 — Projection Read Models
+-- ============================================================
+
+-- application_summary: one row per loan application, current state.
+-- SLO: lag < 500ms. Updated by ProjectionDaemon as events arrive.
+-- agent_sessions_completed: array of session stream IDs that contributed decisions.
+CREATE TABLE application_summary (
+    application_id          TEXT        PRIMARY KEY,
+    state                   TEXT        NOT NULL DEFAULT 'Submitted',
+    applicant_id            TEXT,
+    requested_amount_usd    NUMERIC,
+    approved_amount_usd     NUMERIC,
+    risk_tier               TEXT,
+    fraud_score             NUMERIC,
+    compliance_status       TEXT        NOT NULL DEFAULT 'pending',  -- pending|in_progress|cleared|failed
+    decision                TEXT,                                    -- APPROVE|DECLINE|REFER|NULL
+    agent_sessions_completed TEXT[]     NOT NULL DEFAULT '{}',
+    last_event_type         TEXT,
+    last_event_at           TIMESTAMPTZ,
+    human_reviewer_id       TEXT,
+    final_decision_at       TIMESTAMPTZ,
+    updated_at              TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+-- agent_performance_ledger: aggregated metrics per agent+model_version.
+-- SLO: lag < 500ms. Enables systematic model drift detection.
+CREATE TABLE agent_performance_ledger (
+    agent_id                TEXT        NOT NULL,
+    model_version           TEXT        NOT NULL,
+    analyses_completed      INT         NOT NULL DEFAULT 0,
+    decisions_generated     INT         NOT NULL DEFAULT 0,
+    total_confidence_score  NUMERIC     NOT NULL DEFAULT 0,  -- sum; divide by analyses_completed for avg
+    total_duration_ms       BIGINT      NOT NULL DEFAULT 0,  -- sum; divide by analyses_completed for avg
+    approve_count           INT         NOT NULL DEFAULT 0,
+    decline_count           INT         NOT NULL DEFAULT 0,
+    refer_count             INT         NOT NULL DEFAULT 0,
+    human_override_count    INT         NOT NULL DEFAULT 0,
+    first_seen_at           TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    last_seen_at            TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    PRIMARY KEY (agent_id, model_version)
+);
+
+-- compliance_audit_snapshots: point-in-time snapshots for temporal queries.
+-- Snapshot strategy: event-count trigger (every 10 compliance events per application).
+-- Enables get_compliance_at(application_id, timestamp) without full replay.
+-- snapshot_at: the recorded_at of the last event included in this snapshot.
+CREATE TABLE compliance_audit_snapshots (
+    id                      BIGSERIAL   PRIMARY KEY,
+    application_id          TEXT        NOT NULL,
+    snapshot_at             TIMESTAMPTZ NOT NULL,  -- wall time of last included event
+    last_global_position    BIGINT      NOT NULL,  -- global_position of last included event
+    state                   JSONB       NOT NULL,  -- full serialised ComplianceState
+    created_at              TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+CREATE INDEX idx_compliance_snapshots_app_time
+    ON compliance_audit_snapshots (application_id, snapshot_at DESC);
+
+-- compliance_audit_events: append-only log of every compliance event per application.
+-- Supports full audit trail and temporal replay from any snapshot.
+CREATE TABLE compliance_audit_events (
+    id                      BIGSERIAL   PRIMARY KEY,
+    application_id          TEXT        NOT NULL,
+    global_position         BIGINT      NOT NULL,
+    event_type              TEXT        NOT NULL,
+    rule_id                 TEXT,
+    rule_version            TEXT,
+    regulation_set_version  TEXT,
+    result                  TEXT,        -- passed|failed|requested|cleared
+    failure_reason          TEXT,
+    evidence_hash           TEXT,
+    recorded_at             TIMESTAMPTZ NOT NULL
+);
+CREATE INDEX idx_compliance_audit_events_app
+    ON compliance_audit_events (application_id, recorded_at);

@@ -18,7 +18,13 @@ async def pool():
     p = await asyncpg.create_pool(DATABASE_URL)
     async with p.acquire() as conn:
         await conn.execute(
-            "DROP TABLE IF EXISTS outbox, events, projection_checkpoints, event_streams CASCADE"
+            """
+            DROP TABLE IF EXISTS
+                outbox, events, projection_checkpoints, event_streams,
+                compliance_audit_events, compliance_audit_snapshots,
+                agent_performance_ledger, application_summary
+            CASCADE
+            """
         )
         await conn.execute(SCHEMA)
     yield p
