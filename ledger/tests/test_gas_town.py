@@ -137,7 +137,7 @@ async def test_reconstruct_context_contains_recent_events_verbatim(store):
     context = await reconstruct_agent_context(store, agent_id, session_id)
 
     # Last 3 events: positions 3, 4, 5
-    positions = [e["position"] for e in context.last_3_events]
+    positions = [e["stream_position"] for e in context.last_3_events]
     assert positions == [3, 4, 5]
     types = [e["event_type"] for e in context.last_3_events]
     assert "FraudScreeningCompleted" in types
@@ -255,3 +255,30 @@ async def test_reconstruct_context_token_budget_truncation(store):
     context = await reconstruct_agent_context(store, agent_id, session_id, token_budget=100)
     # 100 tokens * 4 chars = 400 chars max
     assert len(context.context_text) <= 400 + len("\n[...truncated to token budget]") + 10
+
+
+async def test_reconstruct_context_source_field(store):
+    """AgentContext.context_source reflects the value from AgentContextLoaded."""
+    agent_id = str(uuid.uuid4())[:8]
+    session_id = str(uuid.uuid4())[:8]
+    stream_id = f"agent-{agent_id}-{session_id}"
+
+    await store.append(
+        stream_id,
+        [NewEvent("AgentContextLoaded", {
+            "agent_id": agent_id,
+            "session_id": session_id,
+            "context_source": "event_replay",
+            "event_replay_from_position": 10,
+            "context_token_count": 2048,
+            "model_version": "v3.0",
+            "context": {},
+        })],
+        expected_version=0,
+        aggregate_type="AgentSession",
+    )
+
+    context = await reconstruct_agent_context(store, agent_id, session_id)
+
+    assert context.context_source == "event_replay"
+    assert context.model_version == "v3.0"

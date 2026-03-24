@@ -117,3 +117,82 @@ async def test_integrity_check_hash_is_deterministic(store):
     audit_events = await store.load_stream(f"audit-loan-{app_id}")
     stored_hash = audit_events[0].payload["integrity_hash"]
     assert stored_hash == result1.integrity_hash
+
+
+async def test_integrity_check_audit_stream_version_field(store):
+    """IntegrityCheckResult.audit_stream_version reflects the new audit stream version."""
+    app_id = str(uuid.uuid4())[:8]
+    await _append_loan_events(store, app_id)
+
+    result1 = await run_integrity_check(store, "loan", app_id)
+    assert result1.audit_stream_version == 1
+
+    result2 = await run_integrity_check(store, "loan", app_id)
+    assert result2.audit_stream_version == 2
+
+
+async def test_verify_full_chain_validates_all_segments(store):
+    """verify_full_chain() replays every segment and returns one result per check run."""
+    from src.integrity.audit_chain import verify_full_chain
+
+    app_id = str(uuid.uuid4())[:8]
+    await _append_loan_events(store, app_id)
+
+    await run_integrity_check(store, "loan", app_id)
+
+    await store.append(
+        f"loan-{app_id}",
+        [NewEvent("ComplianceCheckRequested", {
+            "application_id": app_id,
+            "regulation_set_version": "v1",
+            "checks_required": ["KYC"],
+        })],
+        expected_version=2,
+        aggregate_type="LoanApplication",
+    )
+    await run_integrity_check(store, "loan", app_id)
+
+    results = await verify_full_chain(store, "loan", app_id)
+
+    assert len(results) == 2
+    assert all(r.chain_valid for r in results)
+    assert all(not r.tamper_detected for r in results)
+    assert results[0].events_verified == 2
+    assert results[1].events_verified == 1
+
+
+async def test_verify_full_chain_detects_tamper(store, pool):
+    """verify_full_chain() reports chain_valid=False when a stored payload is modified."""
+    import json
+    from src.integrity.audit_chain import verify_full_chain
+
+    app_id = str(uuid.uuid4())[:8]
+    await _append_loan_events(store, app_id)
+
+    # Establish baseline hash
+    await run_integrity_check(store, "loan", app_id)
+
+    # Directly tamper with the stored payload of the first event
+    async with pool.acquire() as conn:
+        await conn.execute(
+            """
+            UPDATE events
+            SET payload = $1
+            WHERE stream_id = $2 AND stream_position = 1
+            """,
+            json.dumps({
+                "application_id": app_id,
+                "applicant_id": "TAMPERED",
+                "requested_amount_usd": 99999.0,
+            }),
+            f"loan-{app_id}",
+        )
+
+    # Second check must detect the tamper in the previous segment
+    result2 = await run_integrity_check(store, "loan", app_id)
+    assert result2.chain_valid is False
+    assert result2.tamper_detected is True
+
+    # verify_full_chain also flags the tampered segment
+    results = await verify_full_chain(store, "loan", app_id)
+    assert any(not r.chain_valid for r in results)
