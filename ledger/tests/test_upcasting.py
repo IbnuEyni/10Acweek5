@@ -12,13 +12,14 @@ import pytest
 from src.event_store import EventStore, NewEvent, _UPCASTS
 from src.upcasting.registry import UpcasterRegistry
 
-pytestmark = pytest.mark.asyncio
+# Only async tests use asyncio mark; sync tests are plain pytest functions.
 
 
 # ---------------------------------------------------------------------------
 # Immutability test — the mandatory brief requirement
 # ---------------------------------------------------------------------------
 
+@pytest.mark.asyncio
 async def test_upcast_does_not_modify_stored_payload(pool, store, stream_id):
     """
     THE immutability test from the brief:
@@ -68,6 +69,7 @@ async def test_upcast_does_not_modify_stored_payload(pool, store, stream_id):
         _UPCASTS.pop(("ImmutabilityTestEvent", 1), None)
 
 
+@pytest.mark.asyncio
 async def test_upcast_chain_walks_multiple_versions(pool, store, stream_id):
     """v1 → v2 → v3 chain applied automatically on load."""
     _UPCASTS[("ChainEvent", 1)] = lambda p: {**p, "v2": True}
@@ -157,6 +159,7 @@ def test_registry_no_upcaster_returns_same_event():
 # CreditAnalysisCompleted v1→v2 upcaster (registered in upcasters.py)
 # ---------------------------------------------------------------------------
 
+@pytest.mark.asyncio
 async def test_credit_analysis_v1_upcasted_to_v2_on_load(pool, store, stream_id):
     """
     CreditAnalysisCompleted v1 (missing model_version/confidence_score) is
@@ -195,6 +198,7 @@ async def test_credit_analysis_v1_upcasted_to_v2_on_load(pool, store, stream_id)
     assert "model_version" not in raw or raw.get("model_version") is None or raw == v1_payload
 
 
+@pytest.mark.asyncio
 async def test_decision_generated_v1_upcasted_to_v2_on_load(pool, store, stream_id):
     """DecisionGenerated v1 (missing model_versions) is upcasted to v2 on load."""
     import src.upcasting.upcasters  # noqa: F401

@@ -286,7 +286,7 @@ def register_tools(server: Server, store: EventStore) -> None:
                     checks_required=tuple(arguments.get("checks_required", [])),
                 )
                 compliance = await handle_compliance_check(cmd, store)
-                missing = compliance.required_checks - set(compliance.passed_checks)
+                missing = compliance.required_checks - set(compliance.passed_checks.keys())
                 return _ok({
                     "check_id": cmd.rule_id,
                     "compliance_status": "cleared" if not missing else "in_progress",

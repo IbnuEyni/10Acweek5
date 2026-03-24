@@ -147,7 +147,36 @@ def register_resources(
             if "/performance" in remainder:
                 agent_id = remainder.split("/performance")[0].split("?")[0]
                 async with pool.acquire() as conn:
-                    rows = await agent_perf.get_metrics(agent_id, None, conn)
-                return _json(rows or {"error": "not_found", "agent_id": agent_id})
+                    rows = await conn.fetch(
+                        """
+                        SELECT
+                            agent_id, model_version,
+                            analyses_completed, decisions_generated,
+                            CASE WHEN analyses_completed > 0
+                                 THEN total_confidence_score / analyses_completed ELSE 0
+                            END AS avg_confidence_score,
+                            CASE WHEN analyses_completed > 0
+                                 THEN total_duration_ms / analyses_completed ELSE 0
+                            END AS avg_duration_ms,
+                            CASE WHEN decisions_generated > 0
+                                 THEN approve_count::float / decisions_generated ELSE 0
+                            END AS approve_rate,
+                            CASE WHEN decisions_generated > 0
+                                 THEN decline_count::float / decisions_generated ELSE 0
+                            END AS decline_rate,
+                            CASE WHEN decisions_generated > 0
+                                 THEN refer_count::float / decisions_generated ELSE 0
+                            END AS refer_rate,
+                            human_override_count,
+                            first_seen_at, last_seen_at
+                        FROM agent_performance_ledger
+                        WHERE agent_id = $1
+                        ORDER BY model_version
+                        """,
+                        agent_id,
+                    )
+                if not rows:
+                    return _json({"error": "not_found", "agent_id": agent_id})
+                return _json([dict(r) for r in rows])
 
         return _json({"error": "unknown_resource", "uri": str(uri)})

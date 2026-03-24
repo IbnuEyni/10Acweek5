@@ -68,9 +68,11 @@ class ComplianceAuditViewProjection(Projection):
         "ComplianceClearanceIssued",
     ]
 
-    # In-memory event counter per application — reset on rebuild.
-    # Used to trigger snapshots without an extra DB query per event.
-    _event_counts: dict[str, int] = {}
+    def __init__(self) -> None:
+        # Instance-level counter — not shared across daemon instances or test runs.
+        # Class-level dicts are a subtle production bug: two daemons or two test
+        # fixtures would share state, causing spurious snapshot triggers.
+        self._event_counts: dict[str, int] = {}
 
     async def handle(self, event: RecordedEvent, conn: asyncpg.Connection) -> None:
         p = event.payload

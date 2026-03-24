@@ -166,45 +166,44 @@ async def _apply_to_projections_in_memory(
     pool: asyncpg.Pool,
 ) -> dict[str, Any]:
     """
-    Replay events through projections inside a savepoint that is always
+    Replay events through projections inside a transaction that is always
     rolled back — the real read models are never touched.
 
-    Uses asyncpg's nested transaction (savepoint) so we can roll back the
-    projection writes while keeping the outer connection alive for state reads.
-    State is extracted inside the savepoint before rollback.
+    Pattern: acquire connection → start transaction → apply events → read state
+    → rollback. The rollback is unconditional: we raise _Rollback(outcome) to
+    carry the extracted state out of the transaction block, which causes asyncpg
+    to roll back the transaction cleanly.
+
+    We do NOT use a savepoint here because asyncpg savepoints require an outer
+    transaction, and rolling back the outer transaction after extracting state
+    is the simplest correct approach.
     """
-    outcome: dict[str, Any] = {}
     app_id = _extract_application_id(events)
+    outcome: dict[str, Any] = {}
 
     async with pool.acquire() as conn:
-        # Start an outer transaction so we can use savepoints
         async with conn.transaction():
-            # Apply all events inside a savepoint
-            sp = conn.transaction()
-            await sp.start()
-            try:
-                for event in events:
-                    for projection in projections:
-                        if projection.event_types and event.event_type not in projection.event_types:
-                            continue
-                        try:
-                            await projection.handle(event, conn)
-                        except Exception:
-                            # Non-fatal: counterfactual may produce constraint-violating states
-                            pass
-
-                # Extract state while writes are still visible (inside savepoint)
+            for event in events:
                 for projection in projections:
-                    state = await _read_projection_state(projection, app_id, conn)
-                    outcome[projection.name] = state
-            finally:
-                # Always roll back the savepoint — projection writes never persist
-                await sp.rollback()
+                    if projection.event_types and event.event_type not in projection.event_types:
+                        continue
+                    try:
+                        await projection.handle(event, conn)
+                    except Exception:
+                        # Non-fatal: counterfactual may produce constraint-violating states
+                        pass
 
-            # Roll back the outer transaction too for belt-and-suspenders safety
+            # Extract state while writes are still visible (inside transaction)
+            for projection in projections:
+                state = await _read_projection_state(projection, app_id, conn)
+                outcome[projection.name] = state
+
+            # Unconditional rollback: carry state out via sentinel exception.
+            # asyncpg rolls back the transaction cleanly when an exception
+            # propagates out of `async with conn.transaction()`.
             raise _Rollback(outcome)
 
-    return outcome  # unreachable
+    return outcome  # unreachable — _Rollback always raised above
 
 
 class _Rollback(Exception):

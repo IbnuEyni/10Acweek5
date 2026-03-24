@@ -216,6 +216,10 @@ async def _build_projection_states_at(
     """
     states: dict[str, Any] = {}
 
+    # Normalise examination_date to UTC-aware for consistent comparison
+    if examination_date.tzinfo is None:
+        examination_date = examination_date.replace(tzinfo=timezone.utc)
+
     # ApplicationSummary — replay events up to examination_date
     loan_events = await store.load_stream(f"loan-{application_id}")
     events_at_date = [

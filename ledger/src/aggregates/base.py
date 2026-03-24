@@ -56,10 +56,12 @@ class Aggregate:
         )
         # Apply pending events locally so _apply is the single source of truth.
         # Command methods only stage events; all state mutation lives in _apply.
+        # global_position=0 is a sentinel — not meaningful for in-memory state.
+        from src.event_store import RecordedEvent as _RecordedEvent
+        from datetime import datetime as _dt, timezone as _tz
+        _now = _dt.now(_tz.utc)
         for i, new_event in enumerate(self._pending):
-            from src.event_store import RecordedEvent  # local import avoids cycle
-            from datetime import datetime as _dt, timezone as _tz
-            recorded = RecordedEvent(
+            recorded = _RecordedEvent(
                 event_id=new_event.event_id,
                 stream_id=self.stream_id,
                 stream_position=self.version + i + 1,
@@ -68,7 +70,7 @@ class Aggregate:
                 event_version=new_event.event_version,
                 payload=new_event.payload,
                 metadata=new_event.metadata,
-                recorded_at=_dt.now(_tz.utc),
+                recorded_at=_now,
             )
             self._apply(recorded)
         self.version += len(self._pending)
