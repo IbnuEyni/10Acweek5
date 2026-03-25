@@ -54,7 +54,7 @@ async def fresh_pool() -> asyncpg.Pool:
 # ─────────────────────────────────────────────────────────────────────────────
 
 async def step1_decision_history(pool: asyncpg.Pool) -> str:
-    hdr(1, "Complete Decision History (end-to-end, timed)")
+    hdr(1, "Complete Decision History  [The Week Standard]")
 
     from src.event_store import EventStore
     from src.commands.handlers import (
@@ -137,6 +137,12 @@ async def step1_decision_history(pool: asyncpg.Pool) -> str:
             passed=True, regulation_set_version="v1.0", correlation_id=corr_id,
         ), store)
     ok("ComplianceRulePassed  rule=AML-002")
+
+    # Issue formal compliance clearance now that all required checks have passed
+    from src.aggregates.compliance_record import ComplianceRecordAggregate
+    compliance = await ComplianceRecordAggregate.load(store, app_id)
+    await compliance.issue_clearance(store, correlation_id=corr_id)
+    ok("ComplianceClearanceIssued  clearance=True")
 
     # 7. Generate decision — handler auto-advances AnalysisComplete → ComplianceReview
     await handle_generate_decision(
@@ -410,6 +416,27 @@ async def step5_gas_town(pool: asyncpg.Pool) -> None:
     assert ctx.last_event_position > 0, "Must have events"
     assert ctx.model_version == "apex-v2.1"
     ok("Agent can resume with correct state — Gas Town recovery verified")
+
+    # ── Prove resumption: agent executes a successful action using reconstructed context ──
+    info("Resuming agent using reconstructed context...")
+    from src.commands.handlers import FraudScreeningCompletedCommand, handle_fraud_screening_completed
+    await handle_fraud_screening_completed(
+        FraudScreeningCompletedCommand(
+            application_id=app_id,
+            agent_id=agent_id,
+            session_id=session_id,
+            fraud_score=0.08,
+            anomaly_flags=[],
+            screening_model_version="fraud-v1.3",
+        ), store)
+
+    # Verify the new event landed on the session stream
+    resumed_events = await store.load_stream(f"agent-{agent_id}-{session_id}")
+    last = resumed_events[-1]
+    ok(f"FraudScreeningCompleted appended at stream_position={last.stream_position}  "
+       f"— agent resumed successfully from position {ctx.last_event_position}")
+    assert last.event_type == "FraudScreeningCompleted"
+    assert last.stream_position == ctx.last_event_position + 1
 
 
 # ─────────────────────────────────────────────────────────────────────────────
