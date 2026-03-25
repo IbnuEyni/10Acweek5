@@ -90,119 +90,83 @@ async def mcp(pool, store):
 async def test_full_loan_lifecycle_via_mcp_tools(pool, store, mcp):
     """
     Complete loan application lifecycle driven entirely through MCP tool calls.
-    Asserts each step succeeds and the final state is correct.
+    Zero direct Python function calls — every state transition goes through a tool.
     """
     app_id = str(uuid.uuid4())[:8]
     agent_id = str(uuid.uuid4())[:8]
     session_id = str(uuid.uuid4())[:8]
 
-    # Step 1: Start agent session (Gas Town — required before any agent tool)
+    # Step 1: Start agent session (Gas Town)
     result = await mcp.tool("start_agent_session", {
-        "agent_id": agent_id,
-        "session_id": session_id,
-        "model_version": "v2.3",
-        "context_source": "cold_start",
+        "agent_id": agent_id, "session_id": session_id,
+        "model_version": "v2.3", "context_source": "cold_start",
     })
     assert "error" not in result, f"start_agent_session failed: {result}"
     assert result["session_id"] == session_id
 
     # Step 2: Submit application
     result = await mcp.tool("submit_application", {
-        "application_id": app_id,
-        "applicant_id": "applicant-001",
-        "requested_amount_usd": 100000.0,
-        "loan_purpose": "business_expansion",
+        "application_id": app_id, "applicant_id": "applicant-001",
+        "requested_amount_usd": 100000.0, "loan_purpose": "business_expansion",
     })
     assert "error" not in result, f"submit_application failed: {result}"
     assert result["stream_id"] == f"loan-{app_id}"
 
-    # Advance to AwaitingAnalysis via direct store append (CreditAnalysisRequested)
-    # This is the only direct call — the MCP interface doesn't expose this transition
-    # (it's an internal orchestration step, not a tool in the brief's tool table)
-    from src.commands.handlers import RequestCreditAnalysisCommand, handle_request_credit_analysis
-    await handle_request_credit_analysis(
-        RequestCreditAnalysisCommand(application_id=app_id, assigned_agent_id=agent_id),
-        store,
-    )
+    # Step 3: Advance to AwaitingAnalysis via MCP tool
+    result = await mcp.tool("request_credit_analysis", {
+        "application_id": app_id, "assigned_agent_id": agent_id,
+    })
+    assert "error" not in result, f"request_credit_analysis failed: {result}"
 
-    # Step 3: Record credit analysis
+    # Step 4: Record credit analysis
     result = await mcp.tool("record_credit_analysis", {
-        "application_id": app_id,
-        "agent_id": agent_id,
-        "session_id": session_id,
-        "model_version": "v2.3",
-        "confidence_score": 0.82,
-        "risk_tier": "MEDIUM",
-        "recommended_limit_usd": 90000.0,
-        "duration_ms": 950,
+        "application_id": app_id, "agent_id": agent_id, "session_id": session_id,
+        "model_version": "v2.3", "confidence_score": 0.82,
+        "risk_tier": "MEDIUM", "recommended_limit_usd": 90000.0, "duration_ms": 950,
     })
     assert "error" not in result, f"record_credit_analysis failed: {result}"
 
-    # Step 4: Record fraud screening
+    # Step 5: Record fraud screening
     result = await mcp.tool("record_fraud_screening", {
-        "application_id": app_id,
-        "agent_id": agent_id,
-        "session_id": session_id,
-        "fraud_score": 0.08,
-        "anomaly_flags": [],
-        "screening_model_version": "fraud-v1.1",
+        "application_id": app_id, "agent_id": agent_id, "session_id": session_id,
+        "fraud_score": 0.08, "anomaly_flags": [], "screening_model_version": "fraud-v1.1",
     })
     assert "error" not in result, f"record_fraud_screening failed: {result}"
 
-    # Step 5a: Advance loan to ComplianceReview state (request compliance checks on loan stream)
-    from src.commands.handlers import handle_compliance_check, ComplianceCheckCommand as _CCC
-    # The first compliance check call creates the compliance stream AND advances the loan stream
-    # We need to also write ComplianceCheckRequested to the loan stream via the aggregate
-    from src.aggregates.loan_application import LoanApplicationAggregate
-    app_agg = await LoanApplicationAggregate.load(store, app_id)
-    await app_agg.request_compliance_review(
-        store,
-        regulation_set_version="v2024",
-        checks_required=["KYC", "AML"],
-    )
-
-    # Step 5b: Record compliance checks (KYC + AML)
+    # Step 6: Record compliance checks (KYC + AML)
+    # First call creates the ComplianceRecord stream with checks_required
     result = await mcp.tool("record_compliance_check", {
-        "application_id": app_id,
-        "rule_id": "KYC",
-        "rule_version": "v2024.1",
-        "passed": True,
-        "regulation_set_version": "v2024",
+        "application_id": app_id, "rule_id": "KYC", "rule_version": "v2024.1",
+        "passed": True, "regulation_set_version": "v2024",
         "checks_required": ["KYC", "AML"],
     })
     assert "error" not in result, f"record_compliance_check KYC failed: {result}"
 
     result = await mcp.tool("record_compliance_check", {
-        "application_id": app_id,
-        "rule_id": "AML",
-        "rule_version": "v2024.1",
-        "passed": True,
+        "application_id": app_id, "rule_id": "AML", "rule_version": "v2024.1", "passed": True,
     })
     assert "error" not in result, f"record_compliance_check AML failed: {result}"
     assert result["compliance_status"] == "cleared"
 
-    # Step 6: Generate decision
+    # Step 7: Generate decision (handler auto-advances AnalysisComplete → ComplianceReview)
     session_stream_id = f"agent-{agent_id}-{session_id}"
     result = await mcp.tool("generate_decision", {
-        "application_id": app_id,
-        "orchestrator_agent_id": agent_id,
-        "recommendation": "APPROVE",
-        "confidence_score": 0.82,
+        "application_id": app_id, "orchestrator_agent_id": agent_id,
+        "recommendation": "APPROVE", "confidence_score": 0.82,
         "contributing_agent_sessions": [session_stream_id],
         "decision_basis_summary": "All checks passed, low risk",
         "model_versions": {session_stream_id: "v2.3"},
     })
     assert "error" not in result, f"generate_decision failed: {result}"
 
-    # Step 7: Record human review
+    # Step 8: Record human review
     result = await mcp.tool("record_human_review", {
-        "application_id": app_id,
-        "reviewer_id": "reviewer-001",
-        "final_decision": "APPROVE",
-        "override": False,
+        "application_id": app_id, "reviewer_id": "reviewer-001",
+        "final_decision": "APPROVE", "override": False,
     })
     assert "error" not in result, f"record_human_review failed: {result}"
     assert result["final_decision"] == "APPROVE"
+    assert result["application_state"] == "ApprovedPendingHuman"
 
 
 async def test_mcp_tool_returns_structured_error_on_domain_violation(pool, store, mcp):
@@ -214,23 +178,19 @@ async def test_mcp_tool_returns_structured_error_on_domain_violation(pool, store
     agent_id = str(uuid.uuid4())[:8]
     session_id = str(uuid.uuid4())[:8]
 
-    # Submit application first
     await mcp.tool("submit_application", {
-        "application_id": app_id,
-        "applicant_id": "applicant-002",
+        "application_id": app_id, "applicant_id": "applicant-002",
         "requested_amount_usd": 50000.0,
+    })
+    await mcp.tool("request_credit_analysis", {
+        "application_id": app_id, "assigned_agent_id": agent_id,
     })
 
     # Try credit analysis WITHOUT starting a session — must fail with structured error
     result = await mcp.tool("record_credit_analysis", {
-        "application_id": app_id,
-        "agent_id": agent_id,
-        "session_id": session_id,
-        "model_version": "v2.3",
-        "confidence_score": 0.75,
-        "risk_tier": "LOW",
-        "recommended_limit_usd": 45000.0,
-        "duration_ms": 800,
+        "application_id": app_id, "agent_id": agent_id, "session_id": session_id,
+        "model_version": "v2.3", "confidence_score": 0.75, "risk_tier": "LOW",
+        "recommended_limit_usd": 45000.0, "duration_ms": 800,
     })
     assert result.get("error") is True
     assert "error_type" in result
@@ -309,38 +269,26 @@ async def test_record_credit_analysis_returns_event_id_and_version(pool, store, 
     session_id = str(uuid.uuid4())[:8]
 
     await mcp.tool("start_agent_session", {
-        "agent_id": agent_id,
-        "session_id": session_id,
-        "model_version": "v2.3",
-        "context_source": "cold_start",
+        "agent_id": agent_id, "session_id": session_id,
+        "model_version": "v2.3", "context_source": "cold_start",
     })
     await mcp.tool("submit_application", {
-        "application_id": app_id,
-        "applicant_id": "applicant-ret-test",
+        "application_id": app_id, "applicant_id": "applicant-ret-test",
         "requested_amount_usd": 50000.0,
     })
-
-    from src.commands.handlers import RequestCreditAnalysisCommand, handle_request_credit_analysis
-    await handle_request_credit_analysis(
-        RequestCreditAnalysisCommand(application_id=app_id, assigned_agent_id=agent_id),
-        store,
-    )
+    await mcp.tool("request_credit_analysis", {
+        "application_id": app_id, "assigned_agent_id": agent_id,
+    })
 
     result = await mcp.tool("record_credit_analysis", {
-        "application_id": app_id,
-        "agent_id": agent_id,
-        "session_id": session_id,
-        "model_version": "v2.3",
-        "confidence_score": 0.80,
-        "risk_tier": "LOW",
-        "recommended_limit_usd": 50000.0,
-        "duration_ms": 500,
+        "application_id": app_id, "agent_id": agent_id, "session_id": session_id,
+        "model_version": "v2.3", "confidence_score": 0.80, "risk_tier": "LOW",
+        "recommended_limit_usd": 50000.0, "duration_ms": 500,
     })
 
     assert "error" not in result, f"unexpected error: {result}"
-    assert "event_id" in result, "event_id must be returned per brief spec"
-    assert "new_stream_version" in result, "new_stream_version must be returned per brief spec"
-    # event_id must be a valid UUID string
+    assert "event_id" in result
+    assert "new_stream_version" in result
     import uuid as _uuid
     _uuid.UUID(result["event_id"])
     assert isinstance(result["new_stream_version"], int)
