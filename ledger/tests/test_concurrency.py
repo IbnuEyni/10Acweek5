@@ -182,3 +182,141 @@ async def test_concurrent_handler_credit_analysis_exactly_one_wins(pool):
     session_events = await store.load_stream(f"agent-{winning_agent_id}-{winning_session_id}")
     session_types = [e.event_type for e in session_events]
     assert "CreditAnalysisCompleted" in session_types
+
+
+async def test_combined_loan_and_compliance_concurrent_invariants(pool):
+    """
+    Combined concurrent invariant test.
+
+    Simultaneously races:
+    - Two agents competing to append CreditAnalysisCompleted to the loan stream.
+    - Three compliance agents competing to append ComplianceRulePassed to the
+      compliance stream for the same application.
+
+    Asserts:
+    1. Exactly one CreditAnalysisCompleted lands on the loan stream.
+    2. All three compliance rules eventually land on the compliance stream
+       (each retries after OptimisticConcurrencyError).
+    3. The loan stream and compliance stream version counters are independent —
+       compliance races do not cause OptimisticConcurrencyError on the loan stream.
+    4. All 6 business rule invariants hold after the dust settles:
+       - Loan stream is at the correct version.
+       - ComplianceRecord has all three rules passed.
+    """
+    store = EventStore(pool)
+    app_id = str(uuid.uuid4())
+    agent_a_id = str(uuid.uuid4())
+    agent_b_id = str(uuid.uuid4())
+    session_a_id = str(uuid.uuid4())
+    session_b_id = str(uuid.uuid4())
+
+    # Seed: two agent sessions + loan at AwaitingAnalysis
+    await handle_start_agent_session(
+        StartAgentSessionCommand(agent_id=agent_a_id, session_id=session_a_id, model_version="v2.0"),
+        store,
+    )
+    await handle_start_agent_session(
+        StartAgentSessionCommand(agent_id=agent_b_id, session_id=session_b_id, model_version="v2.0"),
+        store,
+    )
+    await handle_submit_application(
+        SubmitApplicationCommand(application_id=app_id, applicant_id="alice", requested_amount_usd=50_000.0),
+        store,
+    )
+    await handle_request_credit_analysis(
+        RequestCreditAnalysisCommand(application_id=app_id, assigned_agent_id=agent_a_id),
+        store,
+    )
+
+    # Seed the compliance stream so all three compliance agents have something to race on
+    from src.event_store import NewEvent
+    compliance_stream = f"compliance-{app_id}"
+    await store.append(
+        compliance_stream,
+        [NewEvent("ComplianceCheckRequested", {
+            "application_id": app_id,
+            "regulation_set_version": "v1.0",
+            "checks_required": ["KYC", "AML", "OFAC"],
+        })],
+        expected_version=-1,
+        aggregate_type="ComplianceRecord",
+    )
+
+    # ── Loan race: two agents compete on CreditAnalysisCompleted ─────────────
+    async def run_credit_agent(agent_id: str, session_id: str) -> str:
+        cmd = CreditAnalysisCompletedCommand(
+            application_id=app_id, agent_id=agent_id, session_id=session_id,
+            model_version="v2.0", confidence_score=0.85, risk_tier="LOW",
+            recommended_limit_usd=50_000.0, duration_ms=100,
+        )
+        try:
+            await handle_credit_analysis_completed(cmd, store)
+            return "success"
+        except OptimisticConcurrencyError:
+            return "conflict"
+
+    # ── Compliance race: three agents compete on the compliance stream ────────
+    async def run_compliance_agent(rule_id: str) -> None:
+        """Append a ComplianceRulePassed event, retrying on conflict."""
+        max_retries = 5
+        for _ in range(max_retries):
+            try:
+                current = await store.stream_version(compliance_stream)
+                await store.append(
+                    compliance_stream,
+                    [NewEvent("ComplianceRulePassed", {
+                        "application_id": app_id,
+                        "rule_id": rule_id,
+                        "rule_version": "v1",
+                        "evidence_hash": f"hash-{rule_id}",
+                    })],
+                    expected_version=current,
+                    aggregate_type="ComplianceRecord",
+                )
+                return
+            except OptimisticConcurrencyError:
+                continue
+        raise RuntimeError(f"Compliance agent for {rule_id} exhausted retries")
+
+    # Fire all 5 coroutines simultaneously
+    credit_results, *_ = await asyncio.gather(
+        asyncio.gather(
+            run_credit_agent(agent_a_id, session_a_id),
+            run_credit_agent(agent_b_id, session_b_id),
+        ),
+        run_compliance_agent("KYC"),
+        run_compliance_agent("AML"),
+        run_compliance_agent("OFAC"),
+    )
+
+    # 1. Exactly one credit analysis winner
+    assert sorted(credit_results) == ["conflict", "success"], (
+        f"Expected one credit analysis winner, got: {credit_results}"
+    )
+
+    # 2. Loan stream has exactly one CreditAnalysisCompleted
+    loan_events = await store.load_stream(f"loan-{app_id}")
+    credit_events = [e for e in loan_events if e.event_type == "CreditAnalysisCompleted"]
+    assert len(credit_events) == 1, (
+        f"Loan stream must have exactly one CreditAnalysisCompleted, got {len(credit_events)}"
+    )
+
+    # 3. Compliance stream has all three rules passed
+    compliance_events = await store.load_stream(compliance_stream)
+    passed_rules = {
+        e.payload["rule_id"]
+        for e in compliance_events
+        if e.event_type == "ComplianceRulePassed"
+    }
+    assert passed_rules == {"KYC", "AML", "OFAC"}, (
+        f"All three compliance rules must be recorded, got: {passed_rules}"
+    )
+
+    # 4. Stream version counters are independent — compliance version is not
+    #    contaminated by loan stream writes and vice versa.
+    loan_version = await store.stream_version(f"loan-{app_id}")
+    compliance_version = await store.stream_version(compliance_stream)
+    # Loan: Submitted(1) + CreditAnalysisRequested(2) + CreditAnalysisCompleted(3)
+    assert loan_version == 3, f"Loan stream must be at version 3, got {loan_version}"
+    # Compliance: ComplianceCheckRequested(1) + KYC(2) + AML(3) + OFAC(4)
+    assert compliance_version == 4, f"Compliance stream must be at version 4, got {compliance_version}"

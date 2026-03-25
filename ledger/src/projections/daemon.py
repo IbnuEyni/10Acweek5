@@ -86,6 +86,11 @@ class ProjectionDaemon:
     def stop(self) -> None:
         self._running = False
 
+    async def poll_until_caught_up(self) -> None:
+        """Drive all projections to the current head of the event log. Blocks until caught up."""
+        while await self._process_batch():
+            pass
+
     # ------------------------------------------------------------------
     # Core batch processing
     # ------------------------------------------------------------------
