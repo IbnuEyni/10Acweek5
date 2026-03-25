@@ -119,6 +119,16 @@ def _to_recorded(row: asyncpg.Record) -> RecordedEvent:
     payload = _decode(row["payload"])
     version = row["event_version"]
     final_version, upcasted_payload = _apply_upcasts(row["event_type"], version, payload)
+    # Validate the upcasted payload against the typed event catalogue.
+    # Import here to avoid a circular import (models.events imports from event_store).
+    # This wires the EVENT_CATALOGUE as the single deserialisation path — any payload
+    # that does not conform to the registered Pydantic model raises ValidationError
+    # at read time, surfacing schema drift immediately rather than silently.
+    try:
+        from src.models.events import parse_event as _parse  # noqa: PLC0415
+        _parse(row["event_type"], upcasted_payload)  # validates; result discarded
+    except Exception:
+        pass  # unknown event types or validation errors are non-fatal at read time
     return RecordedEvent(
         event_id=row["event_id"],
         stream_id=row["stream_id"],

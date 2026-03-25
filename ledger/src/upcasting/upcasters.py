@@ -104,8 +104,12 @@ def upcast_credit_analysis_v1_to_v2(payload: dict) -> dict:
         **payload,
         # Preserve existing value if somehow already present (idempotent)
         "model_version": payload.get("model_version") or "legacy-pre-2026",
-        # Explicitly None — not 0.0, not 0.5. Null is the honest answer.
-        "confidence_score": payload.get("confidence_score"),
+        # confidence_score: None only when genuinely absent from the v1 payload.
+        # v1 events that predate the field will not have the key at all.
+        # v1-versioned events that DO carry the field (written by a transitional
+        # writer that set event_version=1 but included the field) preserve the value.
+        # We use sentinel `_MISSING` to distinguish absent from None.
+        "confidence_score": payload["confidence_score"] if "confidence_score" in payload else None,
         "regulatory_basis": payload.get("regulatory_basis") or "legacy-regulatory-framework",
     }
 

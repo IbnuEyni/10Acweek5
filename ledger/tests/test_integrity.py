@@ -49,7 +49,9 @@ async def test_integrity_check_returns_result(store):
     assert result.entity_type == "loan"
     assert result.entity_id == app_id
     assert result.events_verified == 2
-    assert result.integrity_hash  # non-empty hash
+    # SHA-256 hex digest is exactly 64 lowercase hex characters
+    assert len(result.integrity_hash) == 64
+    assert all(c in "0123456789abcdef" for c in result.integrity_hash)
     assert result.previous_hash is None  # first check
     assert result.chain_valid is True
     assert result.tamper_detected is False
@@ -64,9 +66,16 @@ async def test_integrity_check_appends_audit_event(store):
 
     audit_events = await store.load_stream(f"audit-loan-{app_id}")
     assert len(audit_events) == 1
+    p = audit_events[0].payload
     assert audit_events[0].event_type == "AuditIntegrityCheckRun"
-    assert audit_events[0].payload["events_verified_count"] == 2
-    assert audit_events[0].payload["chain_valid"] is True
+    assert p["events_verified_count"] == 2
+    assert p["chain_valid"] is True
+    # segment_start_position must be 0 for the first check (started from the beginning)
+    assert p["segment_start_position"] == 0
+    # last_stream_position must equal the stream_position of the last event verified
+    assert p["last_stream_position"] == 2
+    # integrity_hash must be a valid 64-char SHA-256 hex digest
+    assert len(p["integrity_hash"]) == 64
 
 
 async def test_integrity_check_chain_links_across_runs(store):

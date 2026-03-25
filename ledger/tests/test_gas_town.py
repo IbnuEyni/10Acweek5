@@ -123,7 +123,9 @@ async def test_reconstruct_context_after_simulated_crash(store):
     assert context.session_id == session_id
     assert context.last_event_position == 5
     assert context.model_version == "v2.3"
+    # Both app-001 and app-002 have matching CreditAnalysis + FraudScreening pairs
     assert context.session_health_status == "OK"
+    assert context.pending_work == []  # no unresolved partial decisions
     assert len(context.last_3_events) == 3
     assert context.context_text  # non-empty prose summary
 
@@ -147,6 +149,7 @@ async def test_reconstruct_context_needs_reconciliation_on_partial_decision(stor
     """
     If the last event is a CreditAnalysisCompleted with no corresponding
     FraudScreeningCompleted for the same app, flag NEEDS_RECONCILIATION.
+    Explicitly validates pending_work content and NEEDS_RECONCILIATION status.
     """
     agent_id = str(uuid.uuid4())[:8]
     session_id = str(uuid.uuid4())[:8]
@@ -168,7 +171,7 @@ async def test_reconstruct_context_needs_reconciliation_on_partial_decision(stor
         aggregate_type="AgentSession",
     )
 
-    # CreditAnalysisCompleted for app-999 — no completion event follows
+    # CreditAnalysisCompleted for app-999 — no completion event follows (simulated crash)
     await store.append(
         stream_id,
         [NewEvent("CreditAnalysisCompleted", {
@@ -188,9 +191,18 @@ async def test_reconstruct_context_needs_reconciliation_on_partial_decision(stor
 
     context = await reconstruct_agent_context(store, agent_id, session_id)
 
+    # Health status must be NEEDS_RECONCILIATION
     assert context.session_health_status == "NEEDS_RECONCILIATION"
-    assert any("app-999" in w for w in context.pending_work)
+
+    # pending_work must contain exactly one item referencing app-999
+    assert len(context.pending_work) == 1
+    assert "app-999" in context.pending_work[0]
+    assert "CreditAnalysisCompleted" in context.pending_work[0]
+    assert "stream_position=2" in context.pending_work[0]
+
+    # context_text must surface the reconciliation warning
     assert "NEEDS_RECONCILIATION" in context.context_text or "reconciliation" in context.context_text.lower()
+    assert "app-999" in context.context_text
 
 
 async def test_reconstruct_context_empty_session(store):
