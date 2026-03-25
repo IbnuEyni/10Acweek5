@@ -22,6 +22,7 @@ from src.models.events import DomainError
 from src.commands.handlers import (
     StartAgentSessionCommand, handle_start_agent_session,
     SubmitApplicationCommand, handle_submit_application,
+    RequestCreditAnalysisCommand, handle_request_credit_analysis,
     CreditAnalysisCompletedCommand, handle_credit_analysis_completed,
     FraudScreeningCompletedCommand, handle_fraud_screening_completed,
     ComplianceCheckCommand, handle_compliance_check,
@@ -47,7 +48,7 @@ def _err(error_type: str, message: str, **kwargs) -> list[TextContent]:
 
 
 def register_tools(server: Server, store: EventStore) -> None:
-    """Register all 8 MCP tools on the server instance."""
+    """Register all 9 MCP tools on the server instance."""
 
     @server.list_tools()
     async def list_tools() -> list[Tool]:
@@ -89,6 +90,24 @@ def register_tools(server: Server, store: EventStore) -> None:
                         "submission_channel": {"type": "string", "default": "api"},
                     },
                     "required": ["application_id", "applicant_id", "requested_amount_usd"],
+                },
+            ),
+            Tool(
+                name="request_credit_analysis",
+                description=(
+                    "Advance a loan application from Submitted to AwaitingAnalysis and assign an agent. "
+                    "PRECONDITION: application must be in Submitted state. "
+                    "Must be called before record_credit_analysis. "
+                    "Returns stream_id and new_stream_version."
+                ),
+                inputSchema={
+                    "type": "object",
+                    "properties": {
+                        "application_id": {"type": "string"},
+                        "assigned_agent_id": {"type": "string"},
+                        "priority": {"type": "string", "default": "normal"},
+                    },
+                    "required": ["application_id", "assigned_agent_id"],
                 },
             ),
             Tool(
@@ -223,7 +242,16 @@ def register_tools(server: Server, store: EventStore) -> None:
     @server.call_tool()
     async def call_tool(name: str, arguments: dict) -> list[TextContent]:
         try:
-            if name == "start_agent_session":
+            if name == "request_credit_analysis":
+                cmd = RequestCreditAnalysisCommand(
+                    application_id=arguments["application_id"],
+                    assigned_agent_id=arguments["assigned_agent_id"],
+                    priority=arguments.get("priority", "normal"),
+                )
+                app = await handle_request_credit_analysis(cmd, store)
+                return _ok({"stream_id": app.stream_id, "new_stream_version": app.version})
+
+            elif name == "start_agent_session":
                 cmd = StartAgentSessionCommand(
                     agent_id=arguments["agent_id"],
                     session_id=arguments["session_id"],

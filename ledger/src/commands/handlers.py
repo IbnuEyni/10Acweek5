@@ -391,6 +391,21 @@ async def handle_generate_decision(
     compliance = await ComplianceRecordAggregate.load(store, cmd.application_id)
     compliance.assert_all_checks_passed()
     app.assert_contributing_sessions_valid(list(cmd.contributing_agent_sessions))
+
+    # Advance AnalysisComplete → ComplianceReview when needed.
+    # Compliance checks are recorded on the ComplianceRecord stream independently
+    # of the loan stream state machine, so the loan aggregate may still be at
+    # AnalysisComplete when the orchestrator calls generate_decision.
+    from src.aggregates.loan_application import ApplicationState
+    if app.state == ApplicationState.ANALYSIS_COMPLETE:
+        await app.request_compliance_review(
+            store,
+            regulation_set_version=compliance.regulation_set_version or "v1.0",
+            checks_required=list(compliance.required_checks),
+            correlation_id=cmd.correlation_id,
+            causation_id=cmd.causation_id,
+        )
+
     await app.generate_decision(
         store,
         orchestrator_agent_id=cmd.orchestrator_agent_id,
